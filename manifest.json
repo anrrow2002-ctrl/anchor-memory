@@ -1,0 +1,16 @@
+{
+  "display_name": "Anchor Memory",
+  "loading_order": 20,
+  "requires": [],
+  "optional": [],
+  "generate_interceptor": "anchorMemory_onGenerate",
+  "js": "index.js",
+  "css": "style.css",
+  "author": "Anchor Memory custom build",
+  "version": "0.9.3",
+  "homePage": "",
+  "auto_update": false,
+  "hooks": {
+    "activate": "onActivate"
+  }
+}
