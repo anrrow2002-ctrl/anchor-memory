@@ -22,6 +22,12 @@ import {
   buildSceneLedger,
   diffRemovedEntityKeys,
 } from './core/entity-ledger.js';
+import {
+  makeStableMessageKey,
+  isCompletedSummary,
+  summaryRevisionHash,
+  lockCompletedSummaryToSavedSnapshot,
+} from './core/summary-lifecycle.js';
 
 /**
  * SillyTavern compatibility layer.
@@ -137,11 +143,11 @@ function isGenerationActive() {
 
 
 const MODULE = 'anchor_memory';
-const EXTENSION_VERSION = '0.9.3';
+const EXTENSION_VERSION = '0.9.4';
 const DATA_KEY = 'anchorMemory';
 const CORE_PROMPT_KEY = 'anchor_memory_core';
 const RECALL_PROMPT_KEY = 'anchor_memory_recall';
-const DATA_VERSION = 10;
+const DATA_VERSION = 11;
 const RELATIONSHIP_SCHEMA_VERSION = 2;
 const RELATIONSHIP_CHECKPOINT_INTERVAL = 10;
 const VECTOR_DB_NAME = 'anchor-memory-vectors';
@@ -149,7 +155,7 @@ const VECTOR_DB_VERSION = 1;
 const VECTOR_STORE_NAME = 'vectors';
 const MESSAGE_RENDER_MARGIN_PX = 1400;
 const MESSAGE_RENDER_RECENT_COUNT = 16;
-const SOURCE_HASH_SCHEMA_VERSION = 3;
+const SOURCE_HASH_SCHEMA_VERSION = 4;
 const GODLOG_BLOCK_RE = /\s*(?:```[a-zA-Z0-9_-]*\s*)?<Godlog>[\s\S]*?<\/Godlog>(?:\s*```)?\s*/gi;
 const GODLOG_ESCAPED_BLOCK_RE = /\s*&lt;Godlog&gt;[\s\S]*?&lt;\/Godlog&gt;\s*/gi;
 const GODLOG_FIELD_XML_GROUP_RE = /\s*(?:(?:<|&lt;)(?:Nub|Title|Time|Pln|Per|Cond)(?:>|&gt;)[\s\S]*?(?:<|&lt;)\/(?:Nub|Title|Time|Pln|Per|Cond)(?:>|&gt;)\s*){3,}/gi;
@@ -1052,7 +1058,9 @@ function commitCodexReplacement(data, candidate, materials = [], reason = '人�
   data.processing.codexKeys = {};
   for (const material of materials || []) {
     const row = material?.row || material;
-    if (row?.key && row?.rawHash) data.processing.codexKeys[row.key] = row.rawHash;
+    const godlog = material?.godlog || null;
+    const revisionHash = summaryRevisionHash(godlog, row);
+    if (row?.key && revisionHash) data.processing.codexKeys[row.key] = revisionHash;
   }
   data.processing.codexDirty = false;
   data.processing.codexDirtyReason = '';
@@ -1259,8 +1267,10 @@ function memoryData() {
     remappedRelationship.lastGoodKey = keyRemap.get(remappedRelationship.lastGoodKey) || remappedRelationship.lastGoodKey;
     data.relationshipTable = remappedRelationship;
     data.codex.relationship = relationshipTableMarkdown(remappedRelationship, false);
+    const migratedGodlogsByKey = new Map((data.godlogs || []).map(item => [item.key, item]));
     for (const row of rows) {
-      if (data.processing.codexKeys[row.key]) data.processing.codexKeys[row.key] = row.rawHash;
+      if (!data.processing.codexKeys[row.key]) continue;
+      data.processing.codexKeys[row.key] = summaryRevisionHash(migratedGodlogsByKey.get(row.key), row);
     }
     data.processing.sourceHashSchema = SOURCE_HASH_SCHEMA_VERSION;
     migrationTouched = true;
@@ -2159,6 +2169,16 @@ function scheduleMessageKeySave() {
   }, 800);
 }
 
+function persistentMessageIdentity(message) {
+  return message?.send_date
+    || message?.extra?.message_id
+    || message?.message_id
+    || message?.extra?.id
+    || message?.id
+    || message?.created_at
+    || '';
+}
+
 function stableFallbackMessageKey(message, index) {
   if (!message || typeof message !== 'object') return '';
   try {
@@ -2167,10 +2187,15 @@ function stableFallbackMessageKey(message, index) {
     }
     const meta = message.anchor_memory_meta;
     if (!meta.stableMessageKey) {
-      const uuid = globalThis.crypto?.randomUUID?.();
-      meta.stableMessageKey = uuid
-        ? `ammsg:${uuid}`
-        : `ammsg:${Date.now().toString(36)}:${Math.random().toString(36).slice(2, 10)}:${index}`;
+      // Always adopt a plugin-owned key, even when SillyTavern currently exposes send_date/id.
+      // Those host fields may be attached or normalized after generation; preferring them made the
+      // same floor suddenly look like a different row after prompt-injection metadata was saved.
+      meta.stableMessageKey = makeStableMessageKey({
+        persistentIdentity: persistentMessageIdentity(message),
+        role: messageRole(message),
+        index,
+        uuid: globalThis.crypto?.randomUUID?.() || '',
+      });
       scheduleMessageKeySave();
     }
     return String(meta.stableMessageKey || '');
@@ -2180,19 +2205,9 @@ function stableFallbackMessageKey(message, index) {
 }
 
 function messageKey(message, index) {
-  // Keep identity stable across edits/swipes. The revision itself is tracked by rawHash.
-  const persistent = message?.send_date
-    || message?.extra?.message_id
-    || message?.message_id
-    || message?.extra?.id
-    || message?.id
-    || message?.created_at;
-  if (persistent !== undefined && persistent !== null && String(persistent).trim()) {
-    return String(persistent);
-  }
-  // Some imported/legacy chats have no persistent message id. Persist a plugin-owned identity on
-  // the message itself; using the array index here made deleting one middle floor re-key every later
-  // floor and caused a full cascade of summary/anchor invalidation on long chats.
+  // A floor has one plugin-owned identity for its whole lifetime. Host IDs, send_date, prompt
+  // injection bookkeeping, hidden flags and later render metadata must never re-key a completed
+  // summary. Actual content revisions are tracked separately by rawHash.
   return stableFallbackMessageKey(message, index)
     || `legacy:${index}:${messageRole(message)}:${stableHash(message?.name || '')}`;
 }
@@ -2382,11 +2397,15 @@ function syncGodlogCount(data) {
 }
 
 function isGodlogReady(item, row = null) {
-  if (!item || item.status !== 'ready' || item.stale || !String(item.body || '').trim()) return false;
+  // Completed summaries are durable snapshots. A later prompt injection, render refresh, tool
+  // payload, swipe metadata update or even a deliberate text edit must not silently turn the card
+  // into “missing” and start a background rewrite. The user explicitly chooses when to replace it
+  // through “重跑本楼摘要” or by editing/saving the summary.
+  if (!isCompletedSummary(item)) return false;
   if (row && item.archived) return false;
-  if (row && item.rawHash && item.rawHash !== row.rawHash) return false;
   return true;
 }
+
 
 function isGodlogMissingOrStale(data, row) {
   const item = godlogForRow(data, row);
@@ -2508,7 +2527,7 @@ function pendingCodexRows(data) {
   return chatRows(true)
     .filter(row => row.role === 'assistant')
     .map(row => ({ row, godlog: godlogForRow(data, row) }))
-    .filter(({ row, godlog }) => isGodlogReady(godlog, row) && codexKeys[row.key] !== row.rawHash);
+    .filter(({ row, godlog }) => isGodlogReady(godlog, row) && codexKeys[row.key] !== summaryRevisionHash(godlog, row));
 }
 
 function missingGodlogRepairRows(data) {
@@ -3359,7 +3378,8 @@ async function updateCodexFromGodlog(data, row, godlog, force = false) {
     return false;
   }
   if (!data.processing.codexKeys) data.processing.codexKeys = {};
-  if (!force && data.processing.codexKeys[row.key] === row.rawHash) return false;
+  const revisionHash = summaryRevisionHash(godlog, row);
+  if (!force && data.processing.codexKeys[row.key] === revisionHash) return false;
   const contextToken = captureChatContextToken(data);
 
   try {
@@ -3412,7 +3432,7 @@ async function updateCodexFromGodlog(data, row, godlog, force = false) {
       data.processing.relationshipLastGoodAt = candidate.processing.relationshipLastGoodAt;
       data.processing.relationshipRebuildFailures = candidate.processing.relationshipRebuildFailures;
     }
-    data.processing.codexKeys[row.key] = row.rawHash;
+    data.processing.codexKeys[row.key] = revisionHash;
     data.processing.codexDirty = false;
     data.processing.codexDirtyReason = '';
     data.processing.codexDirtyAt = 0;
@@ -3456,7 +3476,8 @@ async function processCodexBacklog(limit = 4) {
       const before = data.processing?.codexKeys?.[row.key] || '';
       await updateCodexFromGodlog(data, row, godlog);
       if (!isSameChatContext(contextToken)) return false;
-      if (data.processing?.codexKeys?.[row.key] === row.rawHash && before !== row.rawHash) completed++;
+      const revisionHash = summaryRevisionHash(godlog, row);
+      if (data.processing?.codexKeys?.[row.key] === revisionHash && before !== revisionHash) completed++;
     }
     return true;
   } finally {
@@ -5060,6 +5081,15 @@ function forgetGodlogItem(data, item, reason = '源楼层已变动', includeUser
   return index >= 0;
 }
 
+function preserveCompletedGodlogOnSourceChange(data, item, row, reason = '楼层在摘要完成后发生了变化') {
+  if (!data || !item || !row) return false;
+  const changed = lockCompletedSummaryToSavedSnapshot(item, row, reason);
+  if (!changed) return false;
+  rememberMessageGodlogCard(data, row, item, 'ready');
+  refreshCoverageMaps(data);
+  return true;
+}
+
 function markGodlogForSourceRefresh(data, item, row, reason = '源楼层内容已更新') {
   if (!data || !item || !row) return false;
   noteRowRevision(row, true);
@@ -5123,8 +5153,14 @@ function syncGodlogsWithChat(reason = '聊天变动') {
     }
 
     if (item.rawHash && item.rawHash !== row.rawHash) {
-      changed = markGodlogForSourceRefresh(data, item, row, reason || '源楼层已编辑或重生成') || changed;
+      changed = isCompletedSummary(item)
+        ? preserveCompletedGodlogOnSourceChange(data, item, row, reason || '楼层在摘要完成后发生了变化') || changed
+        : markGodlogForSourceRefresh(data, item, row, reason || '源楼层已编辑或重生成') || changed;
       continue;
+    }
+
+    if (item.sourceMismatch || item.currentRawHash || item.sourceMismatchReason) {
+      changed = preserveCompletedGodlogOnSourceChange(data, item, row, '') || changed;
     }
 
     if (syncGodlogNumber(item, row)) {
@@ -5510,15 +5546,8 @@ async function generateGodlogForRow(row, force = false) {
   const contextToken = captureChatContextToken(data);
   const operationEpoch = state.contextEpoch;
   const existing = godlogForRow(data, row);
-  if (force && existing) {
-    markAnchorsStaleByKey(data, row.key, '逐楼摘要被手动重跑');
-    delete data.messageRecalls?.[row.key];
-    rollbackRelationshipToFloor(data, Number(row.index) - 1, '逐楼摘要被手动重跑');
-    markCodexDirty(data, '逐楼摘要被手动重跑');
-    saveMemory(true);
-    await enforceAnchorHiddenState(data);
-    if (!isSameChatContext(contextToken)) return false;
-  }
+  const replacingCompleted = !!(force && isCompletedSummary(existing));
+
   if (!force && isGodlogReady(existing, row)) {
     if (syncGodlogNumber(existing, row)) {
       removeStoredVector(data, existing.id);
@@ -5541,8 +5570,8 @@ async function generateGodlogForRow(row, force = false) {
     const latest = latestAssistantRow();
     const isLatest = !!latest && latest.key === row.key;
     const visibleGenerationActive = isLatest && isGenerationActive();
-    // Manual rerun is allowed to break a stale lifecycle latch. The source hash is checked again
-    // after the API returns, so a genuinely changing floor still cannot commit a wrong summary.
+    // Manual rerun may break a stale lifecycle latch, but the old completed summary remains active
+    // until a replacement has actually passed validation and is ready to commit.
     if (force && !visibleGenerationActive) {
       state.generationLifecycleActive = false;
       cancelSettleTimer(row);
@@ -5554,9 +5583,17 @@ async function generateGodlogForRow(row, force = false) {
 
   const sourceHash = row.rawHash;
   state.activeSummaryRowKey = row.key;
-  const item = upsertGodlog(data, row, force
-    ? { status: 'pending', stale: true, error: '正在重新生成；旧摘要会保留到新摘要完成。' }
-    : { status: 'pending', error: '' });
+  const item = replacingCompleted
+    ? existing
+    : upsertGodlog(data, row, force
+      ? { status: 'pending', stale: !!existing?.body, error: '正在重新生成；成功前不会替换已有摘要。' }
+      : { status: 'pending', error: '' });
+
+  if (replacingCompleted) {
+    item.rerunPending = true;
+    item.rerunError = '';
+    item.rerunStartedAt = Date.now();
+  }
   saveMemory();
   showStatus(`正在写逐楼摘要：第 ${row.index + 1} 楼`);
 
@@ -5566,11 +5603,21 @@ async function generateGodlogForRow(row, force = false) {
     body = replaceGodlogField(body, 'Nub', String(item.number || godlogNumberForRow(row) || 1));
     if (!body || body.trim().length < 30) throw new Error('摘要内容为空或过短');
 
-    // The source may change while the secondary model is answering (stream continuation, image
-    // insertion, swipe refresh, or an extension editing the same floor). Never commit a summary
-    // against a fingerprint different from the one sent to the model.
+    // Never commit against a source revision different from the one sent to the writer. For a
+    // manual rerun, keep the old ready snapshot untouched instead of demoting it to missing/stale.
     const latestRow = currentRowForGodlog(item);
     if (!latestRow || latestRow.rawHash !== sourceHash) {
+      if (replacingCompleted) {
+        item.rerunPending = false;
+        item.rerunError = latestRow
+          ? '重跑期间楼层内容继续变化；旧摘要仍然保留，请在正文稳定后手动重跑。'
+          : '重跑期间源楼层被删除；旧摘要记录仍保留在摘要页。';
+        item.rerunFinishedAt = Date.now();
+        if (latestRow) preserveCompletedGodlogOnSourceChange(data, item, latestRow, '重跑期间楼层内容发生变化');
+        saveMemory(true);
+        scheduleGodlogPanelRender();
+        return false;
+      }
       if (latestRow) markGodlogForSourceRefresh(data, item, latestRow, '摘要生成期间楼层内容继续变化');
       else forgetGodlogItem(data, item, '摘要生成期间源楼层被删除');
       saveMemory(true);
@@ -5579,7 +5626,22 @@ async function generateGodlogForRow(row, force = false) {
       return false;
     }
 
+    // Replacement is transactional: dependent memories are revoked only after the new summary is
+    // complete and validated. A failed rerun therefore never destroys the last good snapshot.
+    if (force && existing) {
+      markAnchorsStaleByKey(data, row.key, '逐楼摘要被手动重跑');
+      delete data.messageRecalls?.[row.key];
+      rollbackRelationshipToFloor(data, Number(row.index) - 1, '逐楼摘要被手动重跑');
+      markCodexDirty(data, '逐楼摘要被手动重跑');
+    }
+
     Object.assign(item, {
+      number: godlogNumberForRow(row) || item.number,
+      floor: row.index,
+      key: row.key,
+      role: row.role,
+      name: row.name,
+      sendDate: row.sendDate,
       body,
       rawHash: sourceHash,
       status: 'ready',
@@ -5589,18 +5651,37 @@ async function generateGodlogForRow(row, force = false) {
       error: '',
       retryCount: 0,
       currentRawHash: '',
+      sourceMismatch: false,
+      sourceMismatchReason: '',
+      sourceMismatchAt: 0,
+      rerunPending: false,
+      rerunError: '',
+      rerunFinishedAt: Date.now(),
       updatedAt: Date.now(),
     });
     syncGodlogBlockToMessage(row, item.body);
+    refreshCoverageMaps(data);
     refreshTimelineFromGodlogs(data);
+    data.processing.lastError = '';
     saveMemory(true);
+    await enforceAnchorHiddenState(data);
+    if (!isSameChatContext(contextToken)) return false;
     await updateCodexFromGodlog(data, row, item);
     if (!isSameChatContext(contextToken)) return false;
     await embedMemoryItem(data, item.id, safeGodlogMemoryText(item.body || ''));
     saveMemory(true);
+    if (force && existing) queueMemoryJob('逐楼摘要已手动重跑', 120);
     return true;
   } catch (err) {
     if (!isSameChatContext(contextToken)) return false;
+    if (replacingCompleted) {
+      item.rerunPending = false;
+      item.rerunError = err.message;
+      item.rerunFinishedAt = Date.now();
+      data.processing.lastError = `摘要重跑失败，旧摘要已保留：${err.message}`;
+      saveMemory();
+      return false;
+    }
     const retryCount = (item.retryCount || 0) + 1;
     Object.assign(item, {
       status: retryCount >= 3 || /副API/.test(err.message) ? 'failed' : 'pending',
@@ -6861,7 +6942,10 @@ function renderTableCards(containerSelector, markdown, emptyText, titleKeys = []
 
 function godlogStatusLabel(status, item = null) {
   if (status === 'archived') return '归档';
-  if (status === 'ready') return '已完成';
+  if (status === 'ready') {
+    if (item?.key && state.activeSummaryRowKey === item.key) return '重跑中';
+    return item?.sourceMismatch || item?.rerunError ? '已保存' : '已完成';
+  }
   if (status === 'missing') return '待自动补写';
   if (status === 'failed') return '待补写';
   if (status === 'stale') return '待刷新';
@@ -6949,9 +7033,21 @@ function messageGodlogSummary(item, row) {
 function messageGodlogBody(item, row) {
   if (!item) return missingGodlogUiText(row);
   if (item.body) {
-    const prefix = item.status === 'stale' || item.stale
-      ? '【旧摘要暂存；当前楼稳定后将自动更新】\n'
-      : '';
+    const notices = [];
+    if (item.status === 'stale' || item.stale) {
+      notices.push('【旧摘要暂存；当前楼稳定后将自动更新】');
+    } else {
+      if (item.rerunPending || (item.key && state.activeSummaryRowKey === item.key)) {
+        notices.push('【正在手动重跑；旧摘要继续生效，只有新摘要成功后才会替换。】');
+      }
+      if (item.rerunError) {
+        notices.push(`【上次手动重跑失败：${item.rerunError}；旧摘要仍然保留。】`);
+      }
+      if (item.sourceMismatch) {
+        notices.push('【摘要已保存并锁定；该楼后来发生了注入、渲染或正文变化，插件不会自动重跑。如需按当前正文更新，请手动点“重跑本楼摘要”。】');
+      }
+    }
+    const prefix = notices.length > 0 ? `${notices.join('\n')}\n` : '';
     return `${prefix}${plainGodlogText(item.body)}`;
   }
   if (item.status === 'pending') return item.error || '正文已完成，逐楼摘要正在后台生成或排队。';
@@ -7135,6 +7231,10 @@ function panelRenderSignature(row, item, status, summary, body) {
     id: item?.id || '',
     status,
     stale: !!item?.stale,
+    sourceMismatch: !!item?.sourceMismatch,
+    currentRawHash: item?.currentRawHash || '',
+    rerunPending: !!item?.rerunPending,
+    rerunError: item?.rerunError || '',
     number: item?.number || 0,
     updatedAt: item?.updatedAt || 0,
     summary,
@@ -7313,7 +7413,7 @@ async function rerunGodlogFromPanel(id) {
   renderGodlogPanelForIndex(row.index);
   if (ok) toastr?.success?.(`第 ${row.index + 1} 楼摘要已重新生成`, 'Anchor Memory');
   else if (isGenerationActive() && isLatestAssistantRow(row)) toastr?.warning?.('当前楼仍在由主模型生成，已排队到生成结束后重跑。', 'Anchor Memory');
-  else toastr?.error?.(`本楼摘要未完成：${current?.error || '请检查副API配置或控制台错误'}`, 'Anchor Memory');
+  else toastr?.error?.(`本楼摘要未完成：${current?.rerunError || current?.error || '请检查副API配置或控制台错误'}`, 'Anchor Memory');
 }
 
 function renderMemoryCards(container, items, emptyText) {
@@ -7552,21 +7652,38 @@ async function saveSelectedGodlog() {
   const row = currentRowForGodlog(found.item);
   if (row) body = replaceGodlogField(body, 'Nub', String(godlogNumberForRow(row) || found.item.number || 1));
   const changedBody = body !== found.item.body;
-  if (changedBody) {
-    markAnchorsStaleByKey(found.data, found.item.key, '逐楼摘要被手动修改');
-    delete found.data.messageRecalls?.[found.item.key];
-    rollbackRelationshipToFloor(found.data, Math.max(-1, Number(found.item.floor || 0) - 1), '逐楼摘要被手动修改');
-    markCodexDirty(found.data, '逐楼摘要被手动修改');
+
+  if (!changedBody) {
+    if (row) preserveCompletedGodlogOnSourceChange(found.data, found.item, row, '楼层在摘要保存后发生了变化');
+    saveMemory();
+    updatePreview();
+    scheduleGodlogPanelRender(row?.index ?? found.item.floor);
+    toastr?.info?.('摘要内容没有改动，继续保留原保存版本；不会因为点“保存”而重新绑定当前正文。', 'Anchor Memory');
+    return;
   }
-  found.item.body = body;
-  found.item.status = 'ready';
-  found.item.stale = false;
-  found.item.staleSince = 0;
-  found.item.previousRawHash = '';
-  found.item.retryCount = 0;
-  found.item.error = '';
-  found.item.editedAt = Date.now();
-  found.item.updatedAt = Date.now();
+
+  markAnchorsStaleByKey(found.data, found.item.key, '逐楼摘要被手动修改');
+  delete found.data.messageRecalls?.[found.item.key];
+  rollbackRelationshipToFloor(found.data, Math.max(-1, Number(found.item.floor || 0) - 1), '逐楼摘要被手动修改');
+  markCodexDirty(found.data, '逐楼摘要被手动修改');
+
+  Object.assign(found.item, {
+    body,
+    status: 'ready',
+    stale: false,
+    staleSince: 0,
+    previousRawHash: '',
+    currentRawHash: '',
+    sourceMismatch: false,
+    sourceMismatchReason: '',
+    sourceMismatchAt: 0,
+    rerunPending: false,
+    rerunError: '',
+    retryCount: 0,
+    error: '',
+    editedAt: Date.now(),
+    updatedAt: Date.now(),
+  });
   if (row) {
     Object.assign(found.item, {
       number: godlogNumberForRow(row) || found.item.number,
@@ -7598,7 +7715,7 @@ async function rerunSelectedGodlog() {
     updatePreview();
     if (ok) toastr?.success?.(`第 ${syntheticRow.index + 1} 楼摘要已生成`, 'Anchor Memory');
     else if (isGenerationActive() && isLatestAssistantRow(syntheticRow)) toastr?.warning?.('当前楼仍在由主模型生成，已排队到生成结束后重跑。', 'Anchor Memory');
-    else toastr?.error?.(`本楼摘要未完成：${current?.error || '请检查副API配置或控制台错误'}`, 'Anchor Memory');
+    else toastr?.error?.(`本楼摘要未完成：${current?.rerunError || current?.error || '请检查副API配置或控制台错误'}`, 'Anchor Memory');
     return;
   }
   const found = findGodlogItem(state.selectedGodlogId);
@@ -7624,7 +7741,7 @@ async function rerunSelectedGodlog() {
   updatePreview();
   if (ok) toastr?.success?.(`第 ${row.index + 1} 楼摘要已重新生成`, 'Anchor Memory');
   else if (isGenerationActive() && isLatestAssistantRow(row)) toastr?.warning?.('当前楼仍在由主模型生成，已排队到生成结束后重跑。', 'Anchor Memory');
-  else toastr?.error?.(`本楼摘要未完成：${current?.error || '请检查副API配置或控制台错误'}`, 'Anchor Memory');
+  else toastr?.error?.(`本楼摘要未完成：${current?.rerunError || current?.error || '请检查副API配置或控制台错误'}`, 'Anchor Memory');
 }
 
 function deleteSelectedGodlog() {
