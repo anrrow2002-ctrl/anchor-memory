@@ -143,7 +143,7 @@ function isGenerationActive() {
 
 
 const MODULE = 'anchor_memory';
-const EXTENSION_VERSION = '0.9.5';
+const EXTENSION_VERSION = '0.9.6';
 const DATA_KEY = 'anchorMemory';
 const CORE_PROMPT_KEY = 'anchor_memory_core';
 const RECALL_PROMPT_KEY = 'anchor_memory_recall';
@@ -174,6 +174,10 @@ const RELATIONSHIP_MEMORY_CHAR_BUDGET = 3600;
 const ANCHOR_EVENT_MEMORY_CHAR_BUDGET = 11000;
 const RECENT_FACTS_MEMORY_CHAR_BUDGET = 4800;
 const DYNAMIC_RECALL_MEMORY_CHAR_BUDGET = 3200;
+// Remote embedding APIs can occasionally be slow. Give semantic recall a short, bounded window
+// before the main request is sent, then fall back to deterministic keyword recall rather than
+// allowing a late network result to arrive after the model has already started responding.
+const DYNAMIC_RECALL_PROMPT_WAIT_MS = 1800;
 
 const DEFAULT_GODLOG_RULES = `你是长篇角色扮演的逐回合记忆记录员。你只总结“当前回合”：通常由紧邻的用户输入与随后的 AI 回复组成；若当前是首条 AI 开场楼，则只总结该 AI 回复。Godlog 仅供插件后台使用，禁止写入可见聊天正文，禁止使用 Markdown 代码块。
 
@@ -372,6 +376,7 @@ const state = {
   recallPrefetchPromise: null,
   recallPrefetchResult: null,
   recallPrefetchAt: 0,
+  recallPrefetchStatus: null,
   // The chat metadata object is normalized once per loaded chat. Most hot paths only need a stable
   // reference and must not re-run migrations, relationship-history repair and coverage rebuilds.
   memoryMetadataRef: null,
@@ -3881,8 +3886,10 @@ function buildCoreInjection(data, chat = getContext().chat || []) {
   ].join('\n\n');
 }
 
-function buildRecentFactsInjection(data, rows = chatRows(true)) {
-  state.lastRecentFactsMeta = [];
+function buildRecentFactsInjection(data, rows = chatRows(true), options = {}) {
+  const commit = options.commit !== false;
+  const recentFactsMeta = [];
+  if (commit) state.lastRecentFactsMeta = [];
   refreshCoverageMaps(data);
   const recentRawKeys = new Set(rows
     .filter(row => row.role === 'assistant')
@@ -3900,12 +3907,14 @@ function buildRecentFactsInjection(data, rows = chatRows(true)) {
     .map(({ row, godlog }) => ({ row, godlog, text: safePromptMemoryText('godlog', godlog, 1000) }))
     .filter(entry => entry.text);
   if (entries.length === 0) return '';
-  state.lastRecentFactsMeta = entries.map(({ row, godlog }) => injectionRef('godlog', godlog, {
+  recentFactsMeta.push(...entries.map(({ row, godlog }) => injectionRef('godlog', godlog, {
     floor: row.index,
     key: row.key,
     method: 'unanchored-summary',
     title: godlogFieldValue(godlog.body || '', 'Title'),
-  }));
+  })));
+  if (Array.isArray(options.metaTarget)) options.metaTarget.push(...recentFactsMeta);
+  if (commit) state.lastRecentFactsMeta = recentFactsMeta;
   const parts = [`### 逐楼摘要（尚未进入每 ${Math.max(1, Number(settings().anchorInterval) || 15)} 回合锚点）`];
   for (const { row, text } of entries) {
     parts.push(`#### 第 ${row.assistantNumber || row.index + 1} 个AI回合`);
@@ -4445,6 +4454,38 @@ function clearRecallPrefetch() {
   state.recallPrefetchPromise = null;
   state.recallPrefetchResult = null;
   state.recallPrefetchAt = 0;
+  state.recallPrefetchStatus = null;
+}
+
+function beginDynamicRecallCycle(chat = getContext().chat || [], source = '用户消息已写入') {
+  if (!settings().useDynamicRecall || !hasPersistentChatContext()) return null;
+  const recallQuery = buildRecallQuery(chat);
+  if (!recallQuery.query.trim()) return null;
+  const key = recallQueryCacheKey(recallQuery);
+  if (state.lastRecallQuery?.key === key && ['prefetching', 'prepared', 'injected-before-send'].includes(state.lastRecallQuery.stage)) {
+    return state.lastRecallQuery;
+  }
+  state.lastRecall = '';
+  state.lastRecallMeta = [];
+  state.lastRecallQuery = {
+    key,
+    source: recallQuery.source,
+    preview: clampText(recallQuery.query, 1200),
+    minCount: 0,
+    maxCount: recallMaxCount(),
+    candidateLimit: recallCandidateLimit(),
+    budget: recallTokenBudget(),
+    mode: embeddingConfigured() ? 'embedding-prefetch' : 'keyword',
+    stage: 'prefetching',
+    lifecycleSource: source,
+    startedAt: Date.now(),
+    selectedCount: 0,
+    candidateCount: 0,
+    usedTokens: 0,
+    usedForCurrentPrompt: false,
+  };
+  refreshCommittedRecallUi();
+  return state.lastRecallQuery;
 }
 
 async function prepareDynamicRecall(chat = getContext().chat || []) {
@@ -4464,23 +4505,64 @@ async function prepareDynamicRecall(chat = getContext().chat || []) {
   state.recallPrefetchKey = key;
   state.recallPrefetchResult = null;
   state.recallPrefetchAt = Date.now();
+  state.recallPrefetchStatus = {
+    key,
+    stage: 'prefetching',
+    mode: embeddingConfigured() ? 'embedding' : 'keyword',
+    startedAt: state.recallPrefetchAt,
+    readyAt: 0,
+    resultCount: 0,
+    lateForCurrentPrompt: false,
+  };
   if (!embeddingConfigured()) {
     const result = keywordRecall(memoryData(), recallQuery.query, recallCandidateLimit())
       .map(hit => ({ ...hit, method: 'keyword' }));
     state.recallPrefetchResult = result;
     state.recallPrefetchPromise = null;
+    state.recallPrefetchStatus = {
+      ...state.recallPrefetchStatus,
+      stage: 'ready',
+      readyAt: Date.now(),
+      resultCount: result.length,
+    };
     return result;
   }
   const promise = vectorRecall(memoryData(), recallQuery.query, recallCandidateLimit())
     .then(result => {
-      if (state.recallPrefetchKey === key) state.recallPrefetchResult = result || [];
+      if (state.recallPrefetchKey === key) {
+        const readyAt = Date.now();
+        state.recallPrefetchResult = result || [];
+        const injectedAt = state.lastRecallQuery?.key === key ? Number(state.lastRecallQuery.injectedAt || 0) : 0;
+        state.recallPrefetchStatus = {
+          ...(state.recallPrefetchStatus || {}),
+          key,
+          stage: 'ready',
+          mode: 'embedding',
+          readyAt,
+          resultCount: (result || []).length,
+          lateForCurrentPrompt: !!(injectedAt && readyAt > injectedAt),
+        };
+        refreshCommittedRecallUi();
+      }
       return result || [];
     })
     .catch(err => {
       console.warn('[AnchorMemory] vector recall prefetch failed; prompt will use keyword fallback', err);
       const fallback = keywordRecall(memoryData(), recallQuery.query, recallCandidateLimit())
         .map(hit => ({ ...hit, method: 'keyword' }));
-      if (state.recallPrefetchKey === key) state.recallPrefetchResult = fallback;
+      if (state.recallPrefetchKey === key) {
+        state.recallPrefetchResult = fallback;
+        state.recallPrefetchStatus = {
+          ...(state.recallPrefetchStatus || {}),
+          key,
+          stage: 'ready',
+          mode: 'keyword-after-embedding-error',
+          readyAt: Date.now(),
+          resultCount: fallback.length,
+          error: err?.message || String(err),
+        };
+        refreshCommittedRecallUi();
+      }
       return fallback;
     })
     .finally(() => {
@@ -4490,60 +4572,156 @@ async function prepareDynamicRecall(chat = getContext().chat || []) {
   return promise;
 }
 
-function dynamicRecall(data, chat, rows = chatRows(true)) {
-  state.lastRecallMeta = [];
-  state.lastRecallQuery = null;
+async function resolveDynamicRecallBeforeSend(chat = getContext().chat || [], timeoutMs = DYNAMIC_RECALL_PROMPT_WAIT_MS) {
+  if (!settings().useDynamicRecall || !hasPersistentChatContext()) return null;
+  const recallQuery = buildRecallQuery(chat);
+  if (!recallQuery.query.trim()) return null;
+  const key = recallQueryCacheKey(recallQuery);
+  const cycle = beginDynamicRecallCycle(chat, '生成前召回');
+  const startedAt = Number(cycle?.startedAt || state.recallPrefetchAt || Date.now());
+  const resolveStartedAt = Date.now();
+  const prefetch = prepareDynamicRecall(chat);
+
+  if (!embeddingConfigured()) {
+    const results = await prefetch;
+    const readyAt = Date.now();
+    return {
+      key,
+      results: Array.isArray(results) ? results : [],
+      mode: 'keyword',
+      startedAt,
+      readyAt,
+      waitedMs: Math.max(0, readyAt - resolveStartedAt),
+      prefetchMs: Math.max(0, readyAt - startedAt),
+      timedOut: false,
+    };
+  }
+
+  if (state.recallPrefetchKey === key && Array.isArray(state.recallPrefetchResult)) {
+    const readyAt = Number(state.recallPrefetchStatus?.readyAt || Date.now());
+    return {
+      key,
+      results: state.recallPrefetchResult,
+      mode: state.recallPrefetchResult[0]?.method || 'embedding-no-hit',
+      startedAt,
+      readyAt,
+      waitedMs: 0,
+      prefetchMs: Math.max(0, readyAt - startedAt),
+      timedOut: false,
+    };
+  }
+
+  const waitStartedAt = Date.now();
+  const timeout = Math.max(0, Number(timeoutMs) || 0);
+  let timer = null;
+  const timeoutResult = new Promise(resolve => {
+    timer = setTimeout(() => resolve({ timedOut: true, results: null }), timeout);
+  });
+  const recallResult = Promise.resolve(prefetch)
+    .then(results => ({ timedOut: false, results: Array.isArray(results) ? results : [] }))
+    .catch(() => ({ timedOut: false, results: [] }));
+  const outcome = await Promise.race([recallResult, timeoutResult]);
+  if (timer) clearTimeout(timer);
+  const readyAt = Date.now();
+  if (outcome.timedOut) {
+    return {
+      key,
+      results: null,
+      mode: 'keyword-fallback-timeout',
+      startedAt,
+      readyAt,
+      waitedMs: Math.max(0, readyAt - waitStartedAt),
+      prefetchMs: Math.max(0, readyAt - startedAt),
+      timedOut: true,
+    };
+  }
+  return {
+    key,
+    results: outcome.results,
+    mode: outcome.results[0]?.method || 'embedding-no-hit',
+    startedAt,
+    readyAt,
+    waitedMs: Math.max(0, readyAt - waitStartedAt),
+    prefetchMs: Math.max(0, readyAt - startedAt),
+    timedOut: false,
+  };
+}
+
+function dynamicRecall(data, chat, rows = chatRows(true), options = {}) {
+  const commit = options.commit !== false;
   const recallQuery = buildRecallQuery(chat);
   const key = recallQueryCacheKey(recallQuery);
-  state.lastRecallQuery = {
+  const previousCycle = state.lastRecallQuery?.key === key ? state.lastRecallQuery : null;
+  const resolvedRecall = options.resolvedRecall?.key === key ? options.resolvedRecall : null;
+  const queryState = {
+    key,
     source: recallQuery.source,
     preview: clampText(recallQuery.query, 1200),
     minCount: 0,
     maxCount: recallMaxCount(),
     candidateLimit: recallCandidateLimit(),
     budget: recallTokenBudget(),
-    mode: embeddingConfigured() ? 'embedding-prefetch' : 'keyword',
+    mode: resolvedRecall?.mode || (embeddingConfigured() ? 'embedding-prefetch' : 'keyword'),
+    stage: 'prepared',
+    lifecycleSource: previousCycle?.lifecycleSource || '生成前召回',
+    startedAt: Number(resolvedRecall?.startedAt || previousCycle?.startedAt || state.recallPrefetchAt || Date.now()),
+    readyAt: Number(resolvedRecall?.readyAt || state.recallPrefetchStatus?.readyAt || Date.now()),
+    waitedMs: Number(resolvedRecall?.waitedMs || 0),
+    prefetchMs: Number(resolvedRecall?.prefetchMs || 0),
+    timedOut: !!resolvedRecall?.timedOut,
+    selectedCount: 0,
+    candidateCount: 0,
+    usedTokens: 0,
+    usedForCurrentPrompt: false,
   };
-  if (!recallQuery.query.trim()) return '';
+  const recallMeta = [];
+  if (!recallQuery.query.trim()) {
+    if (commit) {
+      state.lastRecallMeta = [];
+      state.lastRecallQuery = queryState;
+    }
+    return '';
+  }
 
-  // Never wait for a network embedding call in CHAT_COMPLETION_PROMPT_READY. A user-message event
-  // prefetches vectors in the background; if it has not finished, keyword recall is used instantly.
-  let recalled = state.recallPrefetchKey === key && Array.isArray(state.recallPrefetchResult)
-    ? state.recallPrefetchResult
-    : null;
+  let recalled = Array.isArray(resolvedRecall?.results)
+    ? resolvedRecall.results
+    : (state.recallPrefetchKey === key && Array.isArray(state.recallPrefetchResult)
+      ? state.recallPrefetchResult
+      : null);
   if (!recalled || recalled.length === 0) {
     recalled = keywordRecall(data, recallQuery.query, recallCandidateLimit())
       .map(hit => ({ ...hit, method: 'keyword' }));
-    state.lastRecallQuery.mode = state.recallPrefetchKey === key && state.recallPrefetchPromise
-      ? 'keyword-fallback-while-vector-prefetching'
-      : 'keyword';
+    if (resolvedRecall?.timedOut) queryState.mode = 'keyword-fallback-timeout';
+    else if (resolvedRecall && Array.isArray(resolvedRecall.results)) queryState.mode = 'keyword-fallback-no-semantic-hit';
+    else if (state.recallPrefetchKey === key && state.recallPrefetchPromise) queryState.mode = 'keyword-fallback-while-vector-prefetching';
+    else queryState.mode = 'keyword';
   } else {
-    state.lastRecallQuery.mode = recalled[0]?.method || 'embedding';
+    queryState.mode = resolvedRecall?.mode || recalled[0]?.method || 'embedding';
   }
 
   const recentRawKeys = new Set(rows
     .filter(row => row.role === 'assistant')
     .slice(-Math.max(1, Number(settings().keepRecent) || 3))
     .map(row => row.key));
-  const deterministicIds = new Set((state.lastRecentFactsMeta || []).map(ref => ref.id).filter(Boolean));
+  const deterministicRefs = Array.isArray(options.recentFactsMeta)
+    ? options.recentFactsMeta
+    : (state.lastRecentFactsMeta || []);
+  const deterministicIds = new Set(deterministicRefs.map(ref => ref.id).filter(Boolean));
   recalled = recalled.filter(hit => hit.kind === 'godlog'
     && !deterministicIds.has(hit.item?.id)
     && !recentRawKeys.has(hit.item?.key));
 
   const adaptive = selectAdaptiveRecallHits(recalled);
-  if (state.lastRecallQuery) {
-    Object.assign(state.lastRecallQuery, {
-      selectedCount: adaptive.selected.length,
-      candidateCount: adaptive.candidateCount,
-      usedTokens: adaptive.usedTokens,
-      threshold: adaptive.threshold,
-      budget: adaptive.budget,
-    });
-  }
+  Object.assign(queryState, {
+    selectedCount: adaptive.selected.length,
+    candidateCount: adaptive.candidateCount,
+    usedTokens: adaptive.usedTokens,
+    threshold: adaptive.threshold,
+    budget: adaptive.budget,
+  });
   recalled = adaptive.selected;
-  if (!recalled.length) return '';
 
-  state.lastRecallMeta = recalled.map(hit => ({
+  recallMeta.push(...recalled.map(hit => ({
     id: hit.item.id,
     number: hit.item.number,
     floor: hit.item.floor ?? null,
@@ -4554,7 +4732,14 @@ function dynamicRecall(data, chat, rows = chatRows(true)) {
     querySource: recallQuery.source,
     recallReason: hit.recallReason || '',
     recallTokens: hit.recallTokens || 0,
-  }));
+  })));
+  if (Array.isArray(options.metaTarget)) options.metaTarget.push(...recallMeta);
+  if (options.queryTarget && typeof options.queryTarget === 'object') Object.assign(options.queryTarget, queryState);
+  if (commit) {
+    state.lastRecallMeta = recallMeta;
+    state.lastRecallQuery = queryState;
+  }
+  if (!recalled.length) return '';
 
   const parts = ['### 动态召回（与当前输入相关的旧楼细节）'];
   for (const hit of recalled) {
@@ -4647,7 +4832,8 @@ function currentMemoryTokenBudget(chat = getContext().chat || []) {
   });
 }
 
-async function buildPromptReadyInjection(chat = getContext().chat || []) {
+async function buildPromptReadyInjection(chat = getContext().chat || [], options = {}) {
+  const commit = options.commit !== false;
   const data = memoryData();
   const rows = chatRows(true);
   const trackedLabel = trackedCharacterLabel(data);
@@ -4655,13 +4841,27 @@ async function buildPromptReadyInjection(chat = getContext().chat || []) {
     ? '（人物动态索引正在安全重建，本次不注入可能过期的旧表）'
     : (sanitizeCharacterMemoSection(data, data.codex.characterMemo) || '（暂无明确核心转变）');
 
-  const recentFacts = buildRecentFactsInjection(data, rows);
-  state.lastRecentFacts = recentFacts;
-  state.lastRecall = '';
-  state.lastRecallMeta = [];
-  if (!settings().useDynamicRecall) state.lastRecallQuery = null;
-  const recall = settings().useDynamicRecall ? dynamicRecall(data, chat, rows) : '';
-  state.lastRecall = recall;
+  const recentFactsMeta = [];
+  const recallMeta = [];
+  const recallQueryState = {};
+  const recentFacts = buildRecentFactsInjection(data, rows, { commit, metaTarget: recentFactsMeta });
+  const recall = settings().useDynamicRecall
+    ? dynamicRecall(data, chat, rows, {
+      commit,
+      resolvedRecall: options.resolvedRecall || null,
+      recentFactsMeta,
+      metaTarget: recallMeta,
+      queryTarget: recallQueryState,
+    })
+    : '';
+  if (commit) {
+    state.lastRecentFacts = recentFacts;
+    state.lastRecall = recall;
+    if (!settings().useDynamicRecall) {
+      state.lastRecallMeta = [];
+      state.lastRecallQuery = null;
+    }
+  }
   const detailParts = [recentFacts, recall].filter(part => String(part || '').trim());
   const recallEnabled = !!settings().useDynamicRecall;
   const sectionSix = [
@@ -4696,7 +4896,7 @@ async function buildPromptReadyInjection(chat = getContext().chat || []) {
   const budget = currentMemoryTokenBudget(chat);
   const fitted = fitMemorySections(sections, budget);
   const bounded = sanitizeMainPromptMemoryText(fitted.text);
-  state.lastMemoryBudget = {
+  const memoryBudget = {
     budgetTokens: budget,
     usedTokens: estimateTokens(bounded),
     contextSize: state.lastContextSize || 0,
@@ -4704,8 +4904,61 @@ async function buildPromptReadyInjection(chat = getContext().chat || []) {
     allocations: fitted.allocations,
     at: Date.now(),
   };
-  state.lastPromptInjection = bounded;
+  if (commit) {
+    state.lastMemoryBudget = memoryBudget;
+    state.lastPromptInjection = bounded;
+  }
   return bounded;
+}
+
+function markDynamicRecallInjected(backend = 'prompt-ready', content = '') {
+  if (!settings().useDynamicRecall || !state.lastRecallQuery) return;
+  const injectedAt = Date.now();
+  Object.assign(state.lastRecallQuery, {
+    stage: 'injected-before-send',
+    injectedAt,
+    usedForCurrentPrompt: true,
+    backend,
+    containedRecallHits: !!state.lastRecallMeta.length,
+    injectionContainedDynamicRecallSection: String(content || '').includes('动态召回'),
+    totalElapsedMs: Math.max(0, injectedAt - Number(state.lastRecallQuery.startedAt || injectedAt)),
+  });
+  if (state.lastRecallQuery.timedOut
+    && state.recallPrefetchStatus?.key === state.lastRecallQuery.key
+    && Number(state.recallPrefetchStatus.readyAt || 0) >= Number(state.lastRecallQuery.readyAt || 0)) {
+    state.recallPrefetchStatus.lateForCurrentPrompt = true;
+  }
+  console.info(
+    `[AnchorMemory] dynamic recall ${state.lastRecallQuery.mode} prepared before send: `
+    + `${state.lastRecallQuery.selectedCount || 0} hit(s), waited ${state.lastRecallQuery.waitedMs || 0}ms, backend=${backend}`,
+  );
+}
+
+function recallStageText(query = state.lastRecallQuery) {
+  if (!query) return '';
+  if (query.stage === 'injected-before-send') return '已在主请求发送前注入';
+  if (query.stage === 'prepared') return '已完成，等待写入主请求';
+  if (query.stage === 'prefetching') return '正在主请求发送前召回';
+  return query.stage || '';
+}
+
+function refreshCommittedRecallUi() {
+  try {
+    if (!$ || !$('#anchor_memory_workbench').length || !$('#anchor_memory_workbench').hasClass('open')) return;
+    if (!state.selectedRecallMessageKey) {
+      $('#am_recall_preview_title').text(settings().useDynamicRecall
+        ? '第六段：未锚定摘要 + 可选旧楼召回（本轮实际注入）'
+        : '第六段：未锚定摘要（动态召回已关闭）');
+      $('#am_recall_preview_note').hide();
+      $('#am_clear_recall_selection').hide();
+      const lifecycle = state.lastRecallQuery ? `【召回状态】${recallStageText(state.lastRecallQuery)}\n\n` : '';
+      $('#am_recall_preview').val(`${lifecycle}${[state.lastRecentFacts, state.lastRecall].filter(Boolean).join('\n\n')}`
+        || (settings().useDynamicRecall ? '当前没有可补充内容。' : '当前没有未锚定摘要；额外旧楼动态召回已关闭。'));
+    }
+    renderRecallHits();
+  } catch (err) {
+    console.warn('[AnchorMemory] recall UI refresh failed', err);
+  }
 }
 
 function compactInjectionPreview(content, maxChars = 480) {
@@ -4896,6 +5149,9 @@ async function injectMemoryIntoPromptReady(eventData, secondArg = false) {
   if (!s.enabled || !Array.isArray(promptChat)) return;
   try {
     const contextChat = getContext().chat || [];
+    const recallResolutionPromise = !dryRun && s.useDynamicRecall
+      ? resolveDynamicRecallBeforeSend(contextChat, DYNAMIC_RECALL_PROMPT_WAIT_MS)
+      : Promise.resolve(null);
     const replacementStats = applyGodlogContextReplacement(promptChat, {
       mode: 'prompt-ready-history-hide',
       save: false,
@@ -4903,13 +5159,20 @@ async function injectMemoryIntoPromptReady(eventData, secondArg = false) {
     });
     const sanitizedLeaks = sanitizePromptReadyGodlogLeaks(promptChat);
     removeExistingAnchorMemoryPrompt(promptChat);
-    const content = await buildPromptReadyInjection(contextChat);
+    // Horae follows the same ordering: start recall as soon as PROMPT_READY fires, build the other
+    // prompt sections in parallel, then await recall before the final request array is released.
+    const recallResolution = await recallResolutionPromise;
+    const content = await buildPromptReadyInjection(contextChat, {
+      commit: !dryRun,
+      resolvedRecall: recallResolution,
+    });
     let promptRecord = null;
     if (String(content || '').trim()) {
       const insertIndex = resolvePromptInsertIndex(promptChat, normalizedInjectionDepth(s.injectionDepth));
       promptChat.splice(insertIndex, 0, { role: 'system', content });
       sanitizePromptReadyGodlogLeaks(promptChat);
       if (!dryRun) {
+        markDynamicRecallInjected('chat-completion-prompt-ready', content);
         promptRecord = rememberPromptInjectionForNextMessage(memoryData(), contextChat, content);
       }
     }
@@ -4929,6 +5192,7 @@ async function injectMemoryIntoPromptReady(eventData, secondArg = false) {
         targetMessageIndex: promptRecord?.targetIndex ?? null,
       };
       saveMemory();
+      refreshCommittedRecallUi();
     }
   } catch (err) {
     console.error('[AnchorMemory] prompt-ready injection failed', err);
@@ -4941,7 +5205,7 @@ function usesChatCompletionPromptReady() {
   return !!event_types?.CHAT_COMPLETION_PROMPT_READY;
 }
 
-async function injectMemory(chat = getContext().chat || []) {
+async function injectMemory(chat = getContext().chat || [], options = {}) {
   const s = settings();
   const data = memoryData();
   if (!s.enabled) {
@@ -4964,7 +5228,11 @@ async function injectMemory(chat = getContext().chat || []) {
     return;
   }
 
-  const memoryPrompt = await buildPromptReadyInjection(chat);
+  const commit = options.commit === true || options.generation === true;
+  const memoryPrompt = await buildPromptReadyInjection(chat, {
+    commit,
+    resolvedRecall: options.resolvedRecall || null,
+  });
   setExtensionPrompt(
     CORE_PROMPT_KEY,
     memoryPrompt,
@@ -4975,6 +5243,10 @@ async function injectMemory(chat = getContext().chat || []) {
   );
   // Use one deterministic block so the six sections keep the same order on every backend.
   setExtensionPrompt(RECALL_PROMPT_KEY, '', extension_prompt_types.IN_PROMPT, 0);
+  if (options.generation) {
+    markDynamicRecallInjected('extension-prompt-generate-interceptor', memoryPrompt);
+    refreshCommittedRecallUi();
+  }
 }
 
 function markAnchorsStaleByKey(data, key, reason) {
@@ -6572,7 +6844,9 @@ async function reconcileStrictRecentWindow(source = '发送前同步最近正文
 }
 
 function onUserMessageRendered() {
-  prepareDynamicRecall().catch(err => console.warn('[AnchorMemory] recall prefetch failed', err));
+  const chat = getContext().chat || [];
+  beginDynamicRecallCycle(chat, '用户消息写入后');
+  prepareDynamicRecall(chat).catch(err => console.warn('[AnchorMemory] recall prefetch failed', err));
   // This event proves the previous AI floor is no longer streaming. It is an additional Horae-style
   // completion signal, while GENERATION_ENDED/STOPPED and source-hash settling remain authoritative.
   const previousAssistant = observeLatestAssistantRow(false);
@@ -6583,6 +6857,9 @@ function onUserMessageRendered() {
 function onGenerationAfterCommands() {
   // Run before SillyTavern assembles the final prompt so hidden flags affect every backend, not only
   // Chat Completion payloads that emit CHAT_COMPLETION_PROMPT_READY.
+  const chat = getContext().chat || [];
+  beginDynamicRecallCycle(chat, '正式构造请求前');
+  prepareDynamicRecall(chat).catch(err => console.warn('[AnchorMemory] recall prefetch failed before prompt assembly', err));
   reconcileStrictRecentWindow('正式构造请求前').catch(console.warn);
 }
 
@@ -6829,7 +7106,9 @@ function updatePreview() {
   $('#am_current_place_edit').val(data.codex.currentPlace || '');
   $('#am_core_preview').val('正在生成六段记忆拼接预览……');
   const previewContextToken = captureChatContextToken(data);
-  buildPromptReadyInjection(getContext().chat || []).then(content => {
+  // Workbench preview must be side-effect free. It may run while the main model is already
+  // generating, so it must never overwrite the recall record that was actually injected.
+  buildPromptReadyInjection(getContext().chat || [], { commit: false }).then(content => {
     if (isSameChatContext(previewContextToken) && $('#anchor_memory_workbench').hasClass('open')) {
       $('#am_core_preview').val(content || '暂无可注入记忆。');
       $('#am_stat_tokens').text(estimateMemoryTokens(data));
@@ -6845,11 +7124,12 @@ function updatePreview() {
     $('#am_recall_preview').val(formatMessageRecallDetail(selectedRecall, data));
   } else {
     $('#am_recall_preview_title').text(settings().useDynamicRecall
-      ? '第六段：未锚定摘要 + 可选旧楼召回（当前）'
+      ? '第六段：未锚定摘要 + 可选旧楼召回（本轮实际注入）'
       : '第六段：未锚定摘要（动态召回已关闭）');
     $('#am_recall_preview_note').hide();
     $('#am_clear_recall_selection').hide();
-    $('#am_recall_preview').val([state.lastRecentFacts, state.lastRecall].filter(Boolean).join('\n\n')
+    const lifecycle = state.lastRecallQuery ? `【召回状态】${recallStageText(state.lastRecallQuery)}\n\n` : '';
+    $('#am_recall_preview').val(`${lifecycle}${[state.lastRecentFacts, state.lastRecall].filter(Boolean).join('\n\n')}`
       || (settings().useDynamicRecall ? '当前没有可补充内容。' : '当前没有未锚定摘要；额外旧楼动态召回已关闭。'));
   }
   $('#am_character_memo_edit').val(data.codex.characterMemo || '');
@@ -7577,11 +7857,19 @@ function renderRecallHits() {
   if (!container.length) return;
   container.empty();
   if (state.lastRecallQuery && !state.selectedRecallMessageKey) {
+    const query = state.lastRecallQuery;
+    const timingParts = [recallStageText(query)];
+    if (Number.isFinite(Number(query.waitedMs)) && Number(query.waitedMs) > 0) timingParts.push(`等待 ${Number(query.waitedMs)}ms`);
+    if (Number.isFinite(Number(query.totalElapsedMs)) && Number(query.totalElapsedMs) > 0) timingParts.push(`总耗时 ${Number(query.totalElapsedMs)}ms`);
+    if (query.timedOut) timingParts.push('语义召回超时，已用关键词兜底');
+    if (state.recallPrefetchStatus?.key === query.key && state.recallPrefetchStatus?.lateForCurrentPrompt) {
+      timingParts.push('后到的语义结果未用于本轮');
+    }
     container.append(`
         <div class="am-card">
-          <div class="am-card-title"><span>召回查询来源</span><span class="am-pill">${escapeHtml(state.lastRecallQuery.mode || 'keyword')}</span></div>
-        <div class="am-card-meta">最低 ${escapeHtml(state.lastRecallQuery.minCount || 3)} 条 · 实际 ${escapeHtml(state.lastRecallQuery.selectedCount || 0)} 条 · 候选 ${escapeHtml(state.lastRecallQuery.candidateCount || 0)} 条 · ${escapeHtml(state.lastRecallQuery.source || '最近上下文')}</div>
-        <div class="am-card-body">${escapeHtml(state.lastRecallQuery.preview || '暂无查询内容。')}</div>
+          <div class="am-card-title"><span>本轮动态召回</span><span class="am-pill">${escapeHtml(query.mode || 'keyword')}</span></div>
+        <div class="am-card-meta">${escapeHtml(timingParts.filter(Boolean).join(' · ') || '等待生成前注入')}<br>实际 ${escapeHtml(query.selectedCount ?? 0)} 条 · 候选 ${escapeHtml(query.candidateCount ?? 0)} 条 · ${escapeHtml(query.source || '最近上下文')}</div>
+        <div class="am-card-body">${escapeHtml(query.preview || '暂无查询内容。')}</div>
       </div>
     `);
   }
@@ -8555,7 +8843,7 @@ function installPublicApi() {
     open: openWorkbench,
     getStatus: () => statusText(memoryData()),
     getSnapshot: readonlySnapshot,
-    getPromptPreview: async () => buildPromptReadyInjection(getContext().chat || []),
+    getPromptPreview: async () => buildPromptReadyInjection(getContext().chat || [], { commit: false }),
     getMemoryBudget: () => clonePlainObject(state.lastMemoryBudget || {}),
     getTimelineWarnings: () => clonePlainObject(memoryData().timeline?.warnings || []),
     cancelBackgroundRequests: () => state.requests.abortAll('public-api-cancel'),
@@ -8979,7 +9267,10 @@ function onChatChanged() {
   setExtensionPrompt(CORE_PROMPT_KEY, '', extension_prompt_types.IN_CHAT, 0);
   setExtensionPrompt(RECALL_PROMPT_KEY, '', extension_prompt_types.IN_PROMPT, 0);
   state.lastRecall = '';
+  state.lastRecallMeta = [];
+  state.lastRecallQuery = null;
   state.lastRecentFacts = '';
+  state.lastRecentFactsMeta = [];
   state.lastPromptInjection = '';
 
   // CHAT_CHANGED can be emitted before chatMetadata is fully restored.
@@ -9010,7 +9301,23 @@ window.anchorMemory_onGenerate = async (chat, contextSize, abort, type) => {
   if (Number.isFinite(Number(contextSize)) && Number(contextSize) > 0) state.lastContextSize = Number(contextSize);
   // This interceptor is the last backend-independent guard before prompt construction.
   await reconcileStrictRecentWindow('generate interceptor');
-  await injectMemory(chat || []);
+  const generationChat = chat || [];
+  beginDynamicRecallCycle(generationChat, 'generate interceptor');
+  // Chat-completion backends have a later final-array hook. Start prefetch here, then let
+  // CHAT_COMPLETION_PROMPT_READY await the bounded result while it edits the real request array.
+  // Other backends must resolve recall here because setExtensionPrompt is their final path.
+  let recallResolution = null;
+  if (settings().useDynamicRecall) {
+    if (usesChatCompletionPromptReady()) {
+      prepareDynamicRecall(generationChat).catch(err => console.warn('[AnchorMemory] generate prefetch failed', err));
+    } else {
+      recallResolution = await resolveDynamicRecallBeforeSend(generationChat, DYNAMIC_RECALL_PROMPT_WAIT_MS);
+    }
+  }
+  await injectMemory(generationChat, {
+    generation: !usesChatCompletionPromptReady(),
+    resolvedRecall: recallResolution,
+  });
   if (Array.isArray(chat)) {
     const contextChat = getContext().chat || [];
     // Always apply the cap here as well. CHAT_COMPLETION_PROMPT_READY is a second final-array guard,

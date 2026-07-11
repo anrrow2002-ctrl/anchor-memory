@@ -36,6 +36,18 @@ assert.match(source, /const EXTENSION_VERSION = '0\.9\.6'/);
 assert.match(source, /const DATA_VERSION = 11/);
 assert.match(source, /const SOURCE_HASH_SCHEMA_VERSION = 4/);
 
+// Dynamic recall must resolve before the request is released, and previews must not mutate the
+// record of what was actually injected into the current generation.
+assert.match(source, /const DYNAMIC_RECALL_PROMPT_WAIT_MS = 1800/);
+assert.match(source, /resolveDynamicRecallBeforeSend\(contextChat, DYNAMIC_RECALL_PROMPT_WAIT_MS\)/);
+assert.match(source, /markDynamicRecallInjected\('chat-completion-prompt-ready', content\)/);
+assert.match(source, /stage: 'injected-before-send'/);
+assert.match(source, /usedForCurrentPrompt: true/);
+assert.match(source, /buildPromptReadyInjection\(getContext\(\)\.chat \|\| \[\], \{ commit: false \}\)/);
+assert.match(source, /getPromptPreview: async \(\) => buildPromptReadyInjection\(getContext\(\)\.chat \|\| \[\], \{ commit: false \}\)/);
+assert.match(source, /后到的语义结果未用于本轮/);
+assert.match(source, /Horae follows the same ordering/);
+
 // Completed summaries are durable snapshots: automatic reconciliation must preserve them.
 assert.match(source, /isCompletedSummary\(item\)[\s\S]*preserveCompletedGodlogOnSourceChange/);
 assert.match(source, /摘要已保存并锁定/);
@@ -157,4 +169,4 @@ const elapsed = performance.now() - started;
 assert.equal(ledger.order.length, 5000);
 assert.ok(elapsed < 1500, `5,000-item ledger build too slow: ${elapsed.toFixed(1)}ms`);
 
-console.log(`Anchor Memory 0.9.6 regression checks passed (${elapsed.toFixed(1)}ms entity stress).`);
+console.log(`Anchor Memory 0.9.6 recall-before-send regression checks passed (${elapsed.toFixed(1)}ms entity stress).`);

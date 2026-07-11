@@ -1,4 +1,4 @@
-# Anchor Memory 0.9.5 Mobile Fullscreen Fix
+# Anchor Memory 0.9.6 Recall Before Send
 
 面向长篇 SillyTavern 角色扮演的分层锚点记忆插件。
 
@@ -16,6 +16,20 @@
 
 人物关系仍然是用户固定名单中的“人物 ↔ {{user}}”；NPC 与主角之间的关系继续记录在出场人物库中。向量召回继续使用硅基流动等 OpenAI-compatible Embedding API。
 
+
+
+## 0.9.6 关键修复：动态召回必须先于主模型请求
+
+修复“主模型已经开始输出，面板里才出现动态召回”的时序与显示混淆：
+
+- 用户消息写入后立即开始预取；在 `CHAT_COMPLETION_PROMPT_READY` 的最终请求数组阶段等待语义召回；
+- 语义 Embedding 最多等待 1800ms，及时返回就用于本轮主请求，超时则在发送前立刻改用关键词召回；
+- 后到的语义结果不会伪装成本轮已使用内容，界面会明确显示“未用于本轮”；
+- 工作台的“拼接预览”和 Prompt Preview 改为无副作用，不再覆盖本轮真正发送给主模型的召回记录；
+- 本轮状态会明确显示“正在生成前召回 / 已在主请求发送前注入”、召回方式、等待时间、命中数量；
+- Prompt Inspector 的 dry-run 只生成预览，不再污染正式生成记录。
+
+本版仍保留 0.9.5 的手机全屏修复，数据版本不变，已有记忆无需迁移。
 
 ## 0.9.5 关键修复：手机端全屏面板
 
@@ -100,7 +114,7 @@
 
 ## 安装
 
-将整个 `anchor-memory-0.9.5-MOBILE-FIX` 文件夹作为 SillyTavern 第三方扩展安装。覆盖升级前建议先在“工具”页导出当前记忆 JSON。
+将整个 `anchor-memory-0.9.6-RECALL-BEFORE-SEND` 文件夹作为 SillyTavern 第三方扩展安装。覆盖升级前建议先在“工具”页导出当前记忆 JSON。
 
 升级后首次打开旧聊天会自动：
 
@@ -115,7 +129,7 @@
 
 ```bash
 node --check index.js
-node test_am095.mjs
+node test_am096.mjs
 ```
 
-详细结果见 `TEST-REPORT-0.9.5.md`。
+详细结果见 `TEST-REPORT-0.9.6.md`。

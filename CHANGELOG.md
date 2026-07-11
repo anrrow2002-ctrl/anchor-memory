@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.9.6 - Recall before send
+
+- Dynamic recall now starts on the user-message/generation-preparation events and is resolved inside the final prompt-ready hook before the request is released.
+- Semantic recall gets a bounded 1800ms wait; slow remote embeddings fall back to keyword recall before send.
+- Late semantic results are explicitly marked as not used for the current turn.
+- Workbench and public prompt previews are side-effect free and can no longer overwrite the actual per-turn recall record.
+- Recall UI now shows lifecycle stage, method, latency, candidate count, and actual selected hits.
+- Prompt-inspector dry runs no longer mutate generation bookkeeping.
+
 ## 0.9.5 - Mobile full-screen fix
 
 - Fixed Android/WebView layouts where the workbench only occupied the upper half of the screen.
