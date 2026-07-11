@@ -143,7 +143,7 @@ function isGenerationActive() {
 
 
 const MODULE = 'anchor_memory';
-const EXTENSION_VERSION = '0.9.4';
+const EXTENSION_VERSION = '0.9.5';
 const DATA_KEY = 'anchorMemory';
 const CORE_PROMPT_KEY = 'anchor_memory_core';
 const RECALL_PROMPT_KEY = 'anchor_memory_recall';
@@ -8470,16 +8470,57 @@ function installExtensionSettingsEntry() {
   return true;
 }
 
+let workbenchViewportEventsBound = false;
+let workbenchViewportRaf = 0;
+
+function syncWorkbenchViewport() {
+  const shell = document.getElementById('anchor_memory_workbench');
+  if (!shell) return;
+  const viewport = window.visualViewport;
+  const width = Math.max(240, Math.round(viewport?.width || window.innerWidth || document.documentElement.clientWidth || 0));
+  const height = Math.max(240, Math.round(viewport?.height || window.innerHeight || document.documentElement.clientHeight || 0));
+  const offsetTop = Math.max(0, Math.round(viewport?.offsetTop || 0));
+  const offsetLeft = Math.max(0, Math.round(viewport?.offsetLeft || 0));
+  shell.style.setProperty('--am-vv-width', `${width}px`);
+  shell.style.setProperty('--am-vv-height', `${height}px`);
+  shell.style.setProperty('--am-vv-top', `${offsetTop}px`);
+  shell.style.setProperty('--am-vv-left', `${offsetLeft}px`);
+}
+
+function scheduleWorkbenchViewportSync() {
+  if (workbenchViewportRaf) cancelAnimationFrame(workbenchViewportRaf);
+  workbenchViewportRaf = requestAnimationFrame(() => {
+    workbenchViewportRaf = 0;
+    if ($('#anchor_memory_workbench').hasClass('open')) syncWorkbenchViewport();
+  });
+}
+
+function bindWorkbenchViewportEvents() {
+  if (workbenchViewportEventsBound) return;
+  workbenchViewportEventsBound = true;
+  window.addEventListener('resize', scheduleWorkbenchViewportSync, { passive: true });
+  window.addEventListener('orientationchange', scheduleWorkbenchViewportSync, { passive: true });
+  window.visualViewport?.addEventListener('resize', scheduleWorkbenchViewportSync, { passive: true });
+  window.visualViewport?.addEventListener('scroll', scheduleWorkbenchViewportSync, { passive: true });
+}
+
 function openWorkbench() {
   const shell = $('#anchor_memory_workbench');
   if (!shell.length) return false;
+  bindWorkbenchViewportEvents();
+  syncWorkbenchViewport();
   shell.addClass('open').attr('aria-hidden', 'false');
+  $('body').addClass('am-workbench-open');
+  const content = shell.find('.am-workbench-content').get(0);
+  if (content) content.scrollTop = 0;
+  scheduleWorkbenchViewportSync();
   updatePreview();
   return true;
 }
 
 function closeWorkbench() {
   $('#anchor_memory_workbench').removeClass('open').attr('aria-hidden', 'true');
+  $('body').removeClass('am-workbench-open');
 }
 
 // Recovery hook: `anchorMemoryOpen()` can be called from the browser console even if a theme

@@ -1,4 +1,4 @@
-# Anchor Memory 0.9.4 Summary Lock
+# Anchor Memory 0.9.5 Mobile Fullscreen Fix
 
 面向长篇 SillyTavern 角色扮演的分层锚点记忆插件。
 
@@ -15,6 +15,19 @@
 - 浏览器本地向量模型或 Web Worker 推理。
 
 人物关系仍然是用户固定名单中的“人物 ↔ {{user}}”；NPC 与主角之间的关系继续记录在出场人物库中。向量召回继续使用硅基流动等 OpenAI-compatible Embedding API。
+
+
+## 0.9.5 关键修复：手机端全屏面板
+
+修复部分 Android 手机和 WebView 把页面宽度报告为 800–1000 CSS px，导致旧版 `520px` 全屏规则没有触发、锚点书只占屏幕上半截的问题。
+
+- 面板尺寸改为跟随 `visualViewport`，浏览器地址栏变化、横竖屏切换与软键盘弹出时会重新同步；
+- 手机和平板（含触屏设备与 1024px 内布局）统一使用真正的全屏面板；
+- 打开面板时锁定底层聊天滚动，关闭后恢复；
+- 12 个标签页改为单行横向滑动，不再挤成多行占掉半屏；
+- 表单使用 16px 字号避免移动端聚焦缩放，并加入安全区、惯性滚动和横向表格滚动。
+
+本版不改变记忆数据结构，已有逐楼摘要、锚点、人物、物品、场景、关系表和档案都会原样保留。
 
 ## 0.9.4 关键修复：已完成摘要锁定
 
@@ -87,7 +100,7 @@
 
 ## 安装
 
-将整个 `anchor-memory-0.9.4-SUMMARY-LOCK` 文件夹作为 SillyTavern 第三方扩展安装。覆盖升级前建议先在“工具”页导出当前记忆 JSON。
+将整个 `anchor-memory-0.9.5-MOBILE-FIX` 文件夹作为 SillyTavern 第三方扩展安装。覆盖升级前建议先在“工具”页导出当前记忆 JSON。
 
 升级后首次打开旧聊天会自动：
 
@@ -102,7 +115,7 @@
 
 ```bash
 node --check index.js
-node test_am093.mjs
+node test_am095.mjs
 ```
 
-详细结果见 `TEST-REPORT-0.9.4.md`。
+详细结果见 `TEST-REPORT-0.9.5.md`。

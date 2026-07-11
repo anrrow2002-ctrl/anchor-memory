@@ -620,3 +620,258 @@
     min-height: 180px;
   }
 }
+
+
+/* ========================================================================== */
+/* v0.9.5: mobile / tablet full-viewport workbench hardening                  */
+/*
+ * Some Android WebViews report a CSS viewport around 800-1000px wide even on
+ * a phone. The previous 520px-only fullscreen rule therefore did not run and
+ * the dialog kept its content-sized desktop height, leaving the chat visible
+ * underneath. Keep the shell tied to the visual viewport and treat touch
+ * screens / <=1024px layouts as a real fullscreen application surface.
+ */
+body.am-workbench-open {
+  overflow: hidden !important;
+  overscroll-behavior: none;
+}
+
+.am-workbench-shell {
+  position: fixed !important;
+  top: var(--am-vv-top, 0px) !important;
+  left: var(--am-vv-left, 0px) !important;
+  right: auto !important;
+  bottom: auto !important;
+  width: var(--am-vv-width, 100vw) !important;
+  height: var(--am-vv-height, 100vh) !important;
+  height: var(--am-vv-height, 100dvh) !important;
+  min-width: 0 !important;
+  min-height: 0 !important;
+  max-width: none !important;
+  max-height: none !important;
+  margin: 0 !important;
+  box-sizing: border-box !important;
+  overflow: hidden !important;
+  isolation: isolate;
+  overscroll-behavior: none;
+}
+
+.am-workbench-shell.open {
+  display: flex !important;
+}
+
+.am-workbench-backdrop {
+  width: 100%;
+  height: 100%;
+}
+
+.anchor-memory-settings .am-workbench {
+  height: min(860px, calc(var(--am-vv-height, 100dvh) - 48px));
+  min-height: 0;
+  max-height: calc(var(--am-vv-height, 100dvh) - 48px);
+  box-sizing: border-box;
+}
+
+.anchor-memory-settings .am-workbench-header {
+  flex: 0 0 auto;
+}
+
+.anchor-memory-settings .am-workbench-content {
+  min-width: 0;
+  min-height: 0;
+  max-width: 100%;
+  overflow-x: hidden;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  -webkit-overflow-scrolling: touch;
+  touch-action: pan-y;
+}
+
+.anchor-memory-settings .am-tab-panel,
+.anchor-memory-settings .am-card,
+.anchor-memory-settings .am-hero,
+.anchor-memory-settings .am-panel,
+.anchor-memory-settings .am-note,
+.anchor-memory-settings .am-editor {
+  min-width: 0;
+  max-width: 100%;
+  box-sizing: border-box;
+}
+
+@media screen and (max-width: 1024px), screen and (hover: none) and (pointer: coarse) {
+  .am-workbench-shell {
+    align-items: stretch !important;
+    justify-content: stretch !important;
+    padding: 0 !important;
+  }
+
+  .anchor-memory-settings .am-workbench {
+    width: 100% !important;
+    min-width: 0 !important;
+    max-width: none !important;
+    height: 100% !important;
+    min-height: 0 !important;
+    max-height: none !important;
+    margin: 0 !important;
+    border: 0 !important;
+    border-radius: 0 !important;
+    box-shadow: none !important;
+  }
+
+  .anchor-memory-settings .am-workbench-header {
+    position: relative;
+    z-index: 8;
+    min-height: 52px;
+    padding: calc(10px + env(safe-area-inset-top, 0px)) 12px 10px;
+  }
+
+  .anchor-memory-settings .am-workbench-title {
+    min-width: 0;
+    overflow: hidden;
+  }
+
+  .anchor-memory-settings .am-workbench-title b {
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  .anchor-memory-settings .am-workbench-content {
+    flex: 1 1 auto;
+    width: 100%;
+    padding: 10px 10px calc(14px + env(safe-area-inset-bottom, 0px));
+  }
+
+  /* Horae-style mobile tabs: one compact horizontal row instead of six rows. */
+  .anchor-memory-settings .am-tabs {
+    position: sticky;
+    top: -10px;
+    z-index: 6;
+    display: flex !important;
+    grid-template-columns: none !important;
+    flex-wrap: nowrap;
+    gap: 4px;
+    margin: 0 0 10px;
+    padding: 8px 0 0;
+    overflow-x: auto;
+    overflow-y: hidden;
+    scrollbar-width: thin;
+    overscroll-behavior-x: contain;
+    -webkit-overflow-scrolling: touch;
+    background: var(--SmartThemeBlurTintColor, #1f1f1f);
+  }
+
+  .anchor-memory-settings .am-tab {
+    flex: 0 0 auto;
+    min-width: 78px;
+    min-height: 40px;
+    padding: 8px 10px;
+    white-space: nowrap;
+    touch-action: manipulation;
+  }
+
+  .anchor-memory-settings .am-grid {
+    grid-template-columns: 1fr !important;
+  }
+
+  .anchor-memory-settings .am-stat-grid {
+    grid-template-columns: repeat(2, minmax(0, 1fr)) !important;
+  }
+
+  .anchor-memory-settings .am-hero {
+    align-items: stretch;
+    flex-direction: column;
+  }
+
+  .anchor-memory-settings .am-actions,
+  .anchor-memory-settings .am-toolbar,
+  .anchor-memory-settings .am-card-actions {
+    display: grid;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    align-items: stretch;
+  }
+
+  .anchor-memory-settings .am-actions > button,
+  .anchor-memory-settings .am-toolbar > button,
+  .anchor-memory-settings .am-card-actions > button,
+  .anchor-memory-settings .am-actions > .menu_button,
+  .anchor-memory-settings .am-toolbar > .menu_button {
+    width: 100%;
+    min-width: 0;
+    min-height: 42px;
+    margin: 0;
+    white-space: normal;
+    overflow-wrap: anywhere;
+  }
+
+  .anchor-memory-settings .am-actions > input,
+  .anchor-memory-settings .am-actions > select,
+  .anchor-memory-settings .am-toolbar > input,
+  .anchor-memory-settings .am-toolbar > select {
+    grid-column: 1 / -1;
+    width: 100%;
+    min-width: 0 !important;
+  }
+
+  /* Prevent iOS / some Android WebViews from zooming the whole UI on focus. */
+  .anchor-memory-settings input,
+  .anchor-memory-settings textarea,
+  .anchor-memory-settings select {
+    max-width: 100%;
+    box-sizing: border-box;
+    font-size: 16px;
+  }
+
+  .anchor-memory-settings .am-preview,
+  .anchor-memory-settings .am-prompt {
+    min-height: 180px;
+  }
+
+  .anchor-memory-settings .am-relationship-table-wrap {
+    max-width: 100%;
+    overflow-x: auto;
+    overscroll-behavior-x: contain;
+    -webkit-overflow-scrolling: touch;
+  }
+
+  .am-message-godlog-toggle {
+    grid-template-columns: auto minmax(0, 1fr);
+    align-items: start;
+  }
+
+  .am-message-godlog-floor,
+  .am-message-godlog-status,
+  .am-message-godlog-summary {
+    min-width: 0;
+  }
+
+  .am-message-godlog-status {
+    white-space: normal;
+  }
+
+  .am-message-godlog-summary {
+    grid-column: 2;
+  }
+}
+
+@media screen and (max-width: 430px) {
+  .anchor-memory-settings .am-workbench-content {
+    padding-left: 8px;
+    padding-right: 8px;
+  }
+
+  .anchor-memory-settings .am-tab {
+    min-width: 72px;
+    padding-left: 8px;
+    padding-right: 8px;
+  }
+
+  .anchor-memory-settings .am-stat {
+    padding: 8px;
+  }
+
+  .anchor-memory-settings .am-stat b {
+    font-size: 18px;
+  }
+}

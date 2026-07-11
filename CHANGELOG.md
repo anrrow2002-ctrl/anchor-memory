@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.9.5 - Mobile full-screen fix
+
+- Fixed Android/WebView layouts where the workbench only occupied the upper half of the screen.
+- The workbench now follows `visualViewport`, fills the entire mobile/tablet viewport, and locks background scrolling while open.
+- Mobile tabs use a single horizontally scrollable row, matching Horae's compact responsive approach.
+- Added touch scrolling, safe-area padding, two-column mobile actions/stats, and 16px form controls to prevent focus zoom.
+
 ## 0.9.4 Summary Lock
 
 - 已完成逐楼摘要改为持久快照，楼层后续刷新或注入不再自动失效；
