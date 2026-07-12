@@ -353,6 +353,9 @@
             <input id="am_injection_depth" class="text_pole" type="number" min="0" max="9999" step="1" />
           </label>
         </div>
+        <div class="am-note">
+          间隔可以随时调整：新值从下一批尚未处理的逐楼摘要开始生效，已经生成的锚点与累计合并不会被拆毁或重复计费；正在运行的批次会按启动时的旧值完成。默认 15 / 75 可整批衔接。两项不整除时，插件会在合并边界直接使用逐楼摘要补齐，不会漏楼或重复注入。
+        </div>
 
         <div class="am-section-title">主模型记忆预算</div>
         <div class="am-note">

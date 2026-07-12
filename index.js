@@ -143,7 +143,7 @@ function isGenerationActive() {
 
 
 const MODULE = 'anchor_memory';
-const EXTENSION_VERSION = '0.9.6';
+const EXTENSION_VERSION = '0.9.7';
 const DATA_KEY = 'anchorMemory';
 const CORE_PROMPT_KEY = 'anchor_memory_core';
 const RECALL_PROMPT_KEY = 'anchor_memory_recall';
@@ -178,6 +178,16 @@ const DYNAMIC_RECALL_MEMORY_CHAR_BUDGET = 3200;
 // before the main request is sent, then fall back to deterministic keyword recall rather than
 // allowing a late network result to arrive after the model has already started responding.
 const DYNAMIC_RECALL_PROMPT_WAIT_MS = 1800;
+const DEFAULT_ANCHOR_INTERVAL = 15;
+const DEFAULT_MERGE_INTERVAL = 75;
+
+function normalizeAnchorInterval(value) {
+  return Math.max(5, Math.min(80, Math.round(Number(value) || DEFAULT_ANCHOR_INTERVAL)));
+}
+
+function normalizeMergeInterval(value) {
+  return Math.max(30, Math.min(300, Math.round(Number(value) || DEFAULT_MERGE_INTERVAL)));
+}
 
 const DEFAULT_GODLOG_RULES = `你是长篇角色扮演的逐回合记忆记录员。你只总结“当前回合”：通常由紧邻的用户输入与随后的 AI 回复组成；若当前是首条 AI 开场楼，则只总结该 AI 回复。Godlog 仅供插件后台使用，禁止写入可见聊天正文，禁止使用 Markdown 代码块。
 
@@ -270,8 +280,8 @@ const MERGE_FORMAT_HELP = `### 第 X 次全量合并锚点
 const DEFAULT_SETTINGS = {
   settingsVersion: EXTENSION_VERSION,
   enabled: true,
-  anchorInterval: 15,
-  mergeInterval: 100,
+  anchorInterval: DEFAULT_ANCHOR_INTERVAL,
+  mergeInterval: DEFAULT_MERGE_INTERVAL,
   keepRecent: 3,
   injectionDepth: 4,
   autoHide: true,
@@ -336,6 +346,7 @@ const state = {
   lastInjectionRefs: [],
   jobTimer: null,
   jobRunning: false,
+  pendingIntervalRecheck: false,
   codexTimer: null,
   jobSources: new Set(),
   lastMissingGodlogWarningSignature: '',
@@ -406,6 +417,16 @@ function settings() {
       changed = true;
     }
   }
+  const normalizedAnchorInterval = normalizeAnchorInterval(s.anchorInterval);
+  const normalizedMergeInterval = normalizeMergeInterval(s.mergeInterval);
+  if (s.anchorInterval !== normalizedAnchorInterval) {
+    s.anchorInterval = normalizedAnchorInterval;
+    changed = true;
+  }
+  if (s.mergeInterval !== normalizedMergeInterval) {
+    s.mergeInterval = normalizedMergeInterval;
+    changed = true;
+  }
   if (looksLikeLegacyGodlogRules(s.godlogRules)) {
     s.godlogRules = DEFAULT_GODLOG_RULES;
     changed = true;
@@ -453,6 +474,43 @@ function settings() {
 function saveSetting(key, value) {
   settings()[key] = value;
   saveSettingsDebounced();
+}
+
+function flushDeferredIntervalRecheck() {
+  if (!state.pendingIntervalRecheck) return;
+  if (state.running || state.anchorPreparing || state.mergeRunning || state.jobRunning || state.summaryRunning || state.codexRunning) return;
+  state.pendingIntervalRecheck = false;
+  queueMemoryJob('运行间隔调整后重新检查', 0);
+}
+
+function applyIntervalSettingChange(key, rawValue, input = null) {
+  const isAnchor = key === 'anchorInterval';
+  const currentSettings = settings();
+  const previous = isAnchor
+    ? normalizeAnchorInterval(currentSettings.anchorInterval)
+    : normalizeMergeInterval(currentSettings.mergeInterval);
+  const next = isAnchor ? normalizeAnchorInterval(rawValue) : normalizeMergeInterval(rawValue);
+  if (input) input.value = String(next);
+  if (previous === next) return;
+
+  saveSetting(key, next);
+  const updated = settings();
+  const anchorInterval = normalizeAnchorInterval(updated.anchorInterval);
+  const mergeInterval = normalizeMergeInterval(updated.mergeInterval);
+  const divisibilityNote = mergeInterval % anchorInterval === 0
+    ? `当前 ${anchorInterval}/${mergeInterval} 可整批衔接。`
+    : `当前 ${anchorInterval}/${mergeInterval} 不整除；合并边界会用逐楼摘要补齐，不会漏楼或重复注入。`;
+
+  // Existing derived memory is deliberately not destroyed. The active task snapshots its interval
+  // at start, while the next unprocessed batch immediately follows the new values.
+  safeUpdatePreview('运行间隔设置已调整');
+  state.pendingIntervalRecheck = true;
+  flushDeferredIntervalRecheck();
+  toastr?.info?.(
+    `${isAnchor ? '分段锚点' : '累计合并'}间隔已从 ${previous} 调整为 ${next}。新值从下一批尚未处理的摘要开始生效；已生成历史不会被拆毁，正在运行的批次会按启动时的间隔完成。${divisibilityNote}`,
+    'Anchor Memory',
+    { timeOut: 7000, extendedTimeOut: 3000, closeButton: true, tapToDismiss: true },
+  );
 }
 
 function defaultData() {
@@ -1325,6 +1383,14 @@ function memoryData() {
     }
     if (!Array.isArray(anchor.sourceGodlogIds)) { anchor.sourceGodlogIds = []; migrationTouched = true; }
     if (!Array.isArray(anchor.coveredKeys)) { anchor.coveredKeys = [...anchor.sourceKeys]; migrationTouched = true; }
+    if (!Number.isFinite(Number(anchor.batchSize)) || Number(anchor.batchSize) <= 0) {
+      anchor.batchSize = Math.max(1, anchor.sourceKeys.length || anchor.sourceGodlogIds.length || DEFAULT_ANCHOR_INTERVAL);
+      migrationTouched = true;
+    }
+    if (!Number.isFinite(Number(anchor.intervalUsed)) || Number(anchor.intervalUsed) <= 0) {
+      anchor.intervalUsed = Number(anchor.batchSize) || DEFAULT_ANCHOR_INTERVAL;
+      migrationTouched = true;
+    }
   }
 
   // v0.6 merges only stored sourceAnchorIds. Convert them to cumulative sourceKeys so a single
@@ -1344,10 +1410,23 @@ function memoryData() {
     const normalizedKeys = [...new Set(keys)];
     if (JSON.stringify(merge.sourceKeys || []) !== JSON.stringify(normalizedKeys)) migrationTouched = true;
     merge.sourceKeys = normalizedKeys;
+    if (!Array.isArray(merge.cycleSourceKeys) || merge.cycleSourceKeys.length === 0) {
+      const previousKeys = new Set(cumulative);
+      merge.cycleSourceKeys = normalizedKeys.filter(key => !previousKeys.has(key));
+      migrationTouched = true;
+    }
+    if (!Number.isFinite(Number(merge.cycleSize)) || Number(merge.cycleSize) <= 0) {
+      merge.cycleSize = Math.max(1, merge.cycleSourceKeys.length || normalizedKeys.length || DEFAULT_MERGE_INTERVAL);
+      migrationTouched = true;
+    }
+    if (!Number.isFinite(Number(merge.intervalUsed)) || Number(merge.intervalUsed) <= 0) {
+      merge.intervalUsed = Number(merge.cycleSize) || DEFAULT_MERGE_INTERVAL;
+      migrationTouched = true;
+    }
     cumulative = merge.sourceKeys;
   }
 
-  // Repair legacy anchors that straddled a 100-turn boundary (for example 91-105).
+  // Repair legacy anchors that straddled an already-written cumulative merge boundary.
   // The merged portion already belongs to the cumulative history anchor, while the tail must be
   // released and regrouped from clean post-boundary summaries.
   if (cumulative.length > 0) {
@@ -2515,8 +2594,8 @@ function pendingGodlogRows(data) {
 function hasPendingMemoryWork() {
   if (!hasPersistentChatContext()) return false;
   const data = memoryData();
-  const anchorInterval = Math.max(1, Number(settings().anchorInterval) || 15);
-  const mergeInterval = Math.max(1, Number(settings().mergeInterval) || 100);
+  const anchorInterval = normalizeAnchorInterval(settings().anchorInterval);
+  const mergeInterval = normalizeMergeInterval(settings().mergeInterval);
   return pendingGodlogRows(data).length > 0
     || pendingAnchorMaterials(data).length >= anchorInterval
     || mergeCycleMaterials(data).length >= mergeInterval
@@ -2638,8 +2717,8 @@ function maybeWarnMissingGodlogs(data = memoryData()) {
   const suffix = issues.length > 4 ? `等 ${issues.length} 楼` : '';
   const canRetry = !!(settings().useSecondary && settings().secondaryUrl && settings().secondaryKey);
   const retryText = canRetry
-    ? '插件会继续自动重试；点这里打开“逐楼摘要”，也可以点“自动补写缺失摘要”立即重跑。'
-    : '先补全副API；点这里打开“逐楼摘要”，配置后点“自动补写缺失摘要”即可自动重跑。';
+    ? '插件会继续自动重试；也可在锚点书的“逐楼摘要”页点击“自动补写缺失摘要”立即重跑。'
+    : '请先在锚点书中补全副API，再到“逐楼摘要”页点击“自动补写缺失摘要”。';
   const currentSettings = settings();
   const message = `${floors}${suffix} 没有生成逐楼摘要。${retryText}在摘要补齐前，该楼不会进入每 ${currentSettings.anchorInterval} 个有效AI回合的分段锚点或每 ${currentSettings.mergeInterval} 个有效AI回合的累计合并；若它已超过最近原文窗口，主模型只会看到“摘要缺失”状态，不会重新收到完整旧正文。`;
 
@@ -2652,10 +2731,8 @@ function maybeWarnMissingGodlogs(data = memoryData()) {
     toastr.warning(message, 'Anchor Memory', {
       timeOut: 14000,
       extendedTimeOut: 8000,
-      onclick: () => {
-        openWorkbench();
-        activateTab('summaries');
-      },
+      closeButton: true,
+      tapToDismiss: true,
     });
   } else {
     showStatus(message);
@@ -3496,6 +3573,7 @@ async function processCodexBacklog(limit = 4) {
       || (completed > 0 && pendingCodexRows(data).length > 0)) {
       scheduleCodexBacklog(limit);
     }
+    flushDeferredIntervalRecheck();
   }
 }
 
@@ -3588,6 +3666,7 @@ async function rebuildCodexFromGodlogs(confirmFirst = true) {
     data.processing.codexBusy = false;
     saveMemory(true);
     showStatus(statusText(memoryData()));
+    flushDeferredIntervalRecheck();
   }
 }
 
@@ -3666,6 +3745,7 @@ async function rebuildRelationshipFromGodlogs(confirmFirst = true) {
     data.processing.codexBusy = false;
     saveMemory(true);
     showStatus(statusText(memoryData()));
+    flushDeferredIntervalRecheck();
   }
 }
 
@@ -3708,13 +3788,23 @@ ${renderTemplate(s.anchorRules || DEFAULT_ANCHOR_RULES)}
 ${formatGodlogMaterials(materials)}`;
 }
 
+function anchorBatchSize(anchor = null) {
+  const sourceCount = Array.isArray(anchor?.sourceKeys) ? anchor.sourceKeys.length : 0;
+  const legacyCount = Array.isArray(anchor?.sourceGodlogIds) ? anchor.sourceGodlogIds.length : 0;
+  return Math.max(1, Number(anchor?.batchSize) || sourceCount || legacyCount || Number(anchor?.intervalUsed) || DEFAULT_ANCHOR_INTERVAL);
+}
+
+function anchorBatchLabel(anchor = null) {
+  return `${anchorBatchSize(anchor)}回合锚点`;
+}
+
 function buildMergePrompt(data, plan, force = false) {
   const s = settings();
   const next = data.processing.mergeCount + 1;
   const previousMerge = latestMerge(data)?.body || '（暂无上一次历史锚点，这是第一次全量合并）';
   const blocks = (plan?.blocks || []).map((block, index) => {
     const label = block.kind === 'anchor'
-      ? `${Math.max(1, Number(settings().anchorInterval) || 15)}回合锚点：第${block.item?.number || index + 1}次`
+      ? `${anchorBatchLabel(block.item)}：第${block.item?.number || index + 1}次`
       : `逐楼摘要：第${block.row?.assistantNumber || block.row?.index + 1 || index + 1}回合`;
     const body = block.kind === 'anchor'
       ? safePromptMemoryText('anchor', block.item, 6500)
@@ -3828,8 +3918,8 @@ function relationshipInjectionBlock(data) {
 
 function anchorEventInjectionBlock(data) {
   const parts = [];
-  const anchorInterval = Math.max(1, Number(settings().anchorInterval) || 15);
-  const mergeInterval = Math.max(1, Number(settings().mergeInterval) || 100);
+  const anchorInterval = normalizeAnchorInterval(settings().anchorInterval);
+  const mergeInterval = normalizeMergeInterval(settings().mergeInterval);
   const merge = latestMerge(data);
   parts.push(`**1. 历史锚点简述（累计每 ${mergeInterval} 个有效AI回合）：**`);
   parts.push(merge
@@ -3915,7 +4005,7 @@ function buildRecentFactsInjection(data, rows = chatRows(true), options = {}) {
   })));
   if (Array.isArray(options.metaTarget)) options.metaTarget.push(...recentFactsMeta);
   if (commit) state.lastRecentFactsMeta = recentFactsMeta;
-  const parts = [`### 逐楼摘要（尚未进入每 ${Math.max(1, Number(settings().anchorInterval) || 15)} 回合锚点）`];
+  const parts = [`### 逐楼摘要（尚未进入每 ${normalizeAnchorInterval(settings().anchorInterval)} 回合锚点）`];
   for (const { row, text } of entries) {
     parts.push(`#### 第 ${row.assistantNumber || row.index + 1} 个AI回合`);
     parts.push(text);
@@ -5755,7 +5845,7 @@ async function enforceAnchorHiddenState(data = memoryData()) {
   const chat = getContext().chat || [];
   if (!Array.isArray(chat) || chat.length === 0) return false;
 
-  // “保留最近 N 个 AI 正文”是独立的硬窗口，不再依赖摘要是否成功、是否进入15回合锚点。
+  // “保留最近 N 个 AI 正文”是独立的硬窗口，不再依赖摘要是否成功、是否进入分段锚点。
   // 摘要失败只能造成记忆缺口，不能让第四轮及以前的完整正文重新泄漏到 chat history。
   const plan = recentRawHistoryPlan(chat);
   const desiredHidden = new Set(
@@ -6006,6 +6096,7 @@ async function processGodlogBacklog(limit = 4) {
     data.processing.summaryBusy = false;
     saveMemory();
     updatePreview();
+    flushDeferredIntervalRecheck();
   }
 }
 
@@ -6049,6 +6140,7 @@ async function repairMissingGodlogs(limit = Number.MAX_SAFE_INTEGER) {
     data.processing.summaryBusy = false;
     saveMemory();
     updatePreview();
+    flushDeferredIntervalRecheck();
   }
 }
 
@@ -6401,26 +6493,27 @@ function restoreTemporaryContextReplacement(outbound, backups) {
   }, 0);
 }
 
-async function createAnchorUnlocked(force = false, customMaterials = null) {
+async function createAnchorUnlocked(force = false, customMaterials = null, intervalOptions = {}) {
   if (!hasPersistentChatContext()) return false;
-  const s = settings();
+  const anchorIntervalAtStart = normalizeAnchorInterval(intervalOptions.anchorInterval ?? settings().anchorInterval);
+  const mergeIntervalAtStart = normalizeMergeInterval(intervalOptions.mergeInterval ?? settings().mergeInterval);
   let data = memoryData();
   const contextToken = captureChatContextToken(data);
   const operationEpoch = state.contextEpoch;
   if (data.processing.busy || state.running) return false;
   if (!customMaterials) {
-    await processGodlogBacklog(force ? Number(s.anchorInterval) || 15 : 4);
+    await processGodlogBacklog(force ? anchorIntervalAtStart : 4);
     if (!isSameChatContext(contextToken)) return false;
     data = memoryData();
-    // A 100-turn boundary has priority over a 15-turn anchor. This prevents a 91-105 anchor
-    // from straddling the 100-turn merge and being injected twice.
-    if (!force && mergeCycleMaterials(data).length >= Math.max(1, Number(s.mergeInterval) || 100)) {
-      await maybeMerge(false, true);
+    // The cumulative-merge boundary has priority over a segmented anchor. This prevents a
+    // partially overlapping anchor from straddling the configured merge boundary.
+    if (!force && mergeCycleMaterials(data).length >= mergeIntervalAtStart) {
+      await maybeMerge(false, true, mergeIntervalAtStart);
       if (!isSameChatContext(contextToken)) return false;
       data = memoryData();
     }
   }
-  const interval = Math.max(1, Number(s.anchorInterval) || 15);
+  const interval = anchorIntervalAtStart;
   const available = customMaterials || pendingAnchorMaterials(data);
   const materials = available.slice(0, interval);
   if (!force && materials.length < interval) return false;
@@ -6450,11 +6543,13 @@ async function createAnchorUnlocked(force = false, customMaterials = null) {
     const anchor = {
       id,
       number,
-      kind: 'anchor15',
+      kind: 'anchor',
       body: body.trim(),
       sourceFloors,
       sourceKeys,
       sourceGodlogIds,
+      intervalUsed: interval,
+      batchSize: materials.length,
       coveredFloors: coveredRows.map(row => row.index),
       coveredKeys: coveredRows.map(row => row.key),
       createdAt: Date.now(),
@@ -6470,7 +6565,7 @@ async function createAnchorUnlocked(force = false, customMaterials = null) {
     if (!isSameChatContext(contextToken)) return false;
     await embedMemoryItem(data, id, anchor.body);
     if (!isSameChatContext(contextToken)) return false;
-    await maybeMerge(false, true);
+    await maybeMerge(false, true, mergeIntervalAtStart);
     if (!isSameChatContext(contextToken)) return false;
     safeUpdatePreview('锚点完成后刷新');
     toastr?.success?.(`第 ${number} 次锚点完成`, 'Anchor Memory');
@@ -6492,7 +6587,7 @@ async function createAnchorUnlocked(force = false, customMaterials = null) {
 
 
 
-async function createAnchor(force = false, customMaterials = null) {
+async function createAnchor(force = false, customMaterials = null, intervalOptions = {}) {
   if (state.anchorPreparing || state.mergeRunning) {
     if (force) toastr?.warning?.('已有锚点或累计合并任务正在运行，请勿重复点击', 'Anchor Memory');
     return false;
@@ -6500,23 +6595,23 @@ async function createAnchor(force = false, customMaterials = null) {
   const operationEpoch = state.contextEpoch;
   state.anchorPreparing = true;
   try {
-    return await createAnchorUnlocked(force, customMaterials);
+    return await createAnchorUnlocked(force, customMaterials, intervalOptions);
   } finally {
     if (state.contextEpoch === operationEpoch) state.anchorPreparing = false;
+    flushDeferredIntervalRecheck();
   }
 }
 
 
-async function maybeMergeUnlocked(force = false) {
+async function maybeMergeUnlocked(force = false, intervalOverride = null) {
   if (!hasPersistentChatContext()) return false;
   if (state.running && force) {
     toastr?.warning?.('锚点任务正在运行，稍后再合并', 'Anchor Memory');
     return false;
   }
-  const s = settings();
   const data = memoryData();
   const contextToken = captureChatContextToken(data);
-  const interval = Math.max(1, Number(s.mergeInterval) || 100);
+  const interval = normalizeMergeInterval(intervalOverride ?? settings().mergeInterval);
   const cycle = mergeCycleMaterials(data);
   if (!force && cycle.length < interval) return false;
   const materials = force ? cycle : cycle.slice(0, interval);
@@ -6561,19 +6656,21 @@ async function maybeMergeUnlocked(force = false) {
     const merge = {
       id,
       number,
-      kind: 'merge100',
+      kind: 'merge',
       body: body.trim(),
       sourceKeys: cumulativeKeys,
       cycleSourceKeys: sourceKeys,
       sourceAnchorIds: blocks.filter(block => block.kind === 'anchor').map(block => block.item.id),
       sourceGodlogIds: blocks.filter(block => block.kind === 'godlog').map(block => block.item.id),
       previousMergeId: previous?.id || '',
+      intervalUsed: interval,
+      cycleSize: sourceKeys.length,
       coverageCount: cumulativeKeys.length,
       createdAt: Date.now(),
       floorAt: materials[materials.length - 1]?.row?.index ?? data.processing.lastMergeFloor,
     };
-    // Remove any legacy/delayed anchor that crosses this 100-turn boundary. Its unmerged tail
-    // will be regrouped into a clean 15-turn anchor after the merge.
+    // Remove any legacy/delayed anchor that crosses this merge boundary. Its unmerged tail
+    // will be regrouped into a clean anchor using the currently configured segment interval.
     const crossingIds = new Set(activeAnchorsAfterMerge(data)
       .filter(anchor => {
         const keys = anchor.sourceKeys || [];
@@ -6616,7 +6713,7 @@ async function maybeMergeUnlocked(force = false) {
   }
 }
 
-async function maybeMerge(force = false, allowDuringAnchor = false) {
+async function maybeMerge(force = false, allowDuringAnchor = false, intervalOverride = null) {
   if (state.mergeRunning || ((state.anchorPreparing || state.running) && !allowDuringAnchor)) {
     if (force) toastr?.warning?.('已有锚点或累计合并任务正在运行，请勿重复点击', 'Anchor Memory');
     return false;
@@ -6630,45 +6727,46 @@ async function maybeMerge(force = false, allowDuringAnchor = false) {
     saveMemory();
   }
   try {
-    return await maybeMergeUnlocked(force);
+    return await maybeMergeUnlocked(force, intervalOverride);
   } finally {
     if (state.contextEpoch === operationEpoch) state.mergeRunning = false;
     if (data?.processing && isSameChatContext(contextToken)) {
       data.processing.mergeBusy = false;
       saveMemory(true);
     }
+    flushDeferredIntervalRecheck();
   }
 }
 
 async function batchInitializeHistory() {
   const s = settings();
+  const anchorInterval = normalizeAnchorInterval(s.anchorInterval);
+  const mergeInterval = normalizeMergeInterval(s.mergeInterval);
   const data = memoryData();
   if (state.running || state.summaryRunning || data.processing.busy) {
     toastr?.warning?.('已有记忆任务正在运行', 'Anchor Memory');
     return;
   }
   const total = pendingGodlogRows(data).length;
-  if (total === 0 && pendingAnchorMaterials(data).length === 0 && mergeCycleMaterials(data).length < Number(s.mergeInterval)) {
+  if (total === 0 && pendingAnchorMaterials(data).length === 0 && mergeCycleMaterials(data).length < mergeInterval) {
     toastr?.info?.('没有需要初始化的历史楼层', 'Anchor Memory');
     return;
   }
-  if (!confirm(`将补写逐楼摘要，并严格按每 ${s.anchorInterval} 个AI回合生成锚点、每 ${s.mergeInterval} 个AI回合生成累计历史锚点。继续？`)) return;
+  if (!confirm(`将补写逐楼摘要，并严格按每 ${anchorInterval} 个AI回合生成锚点、每 ${mergeInterval} 个AI回合生成累计历史锚点。继续？`)) return;
 
   await processGodlogBacklog(Number.MAX_SAFE_INTEGER);
-  const anchorInterval = Math.max(1, Number(s.anchorInterval) || 15);
-  const mergeInterval = Math.max(1, Number(s.mergeInterval) || 100);
   let anchorsMade = 0;
   let mergesMade = 0;
 
   while (true) {
     const fresh = memoryData();
     if (mergeCycleMaterials(fresh).length >= mergeInterval) {
-      if (!await maybeMerge(false)) break;
+      if (!await maybeMerge(false, false, mergeInterval)) break;
       mergesMade++;
       continue;
     }
     if (pendingAnchorMaterials(fresh).length >= anchorInterval) {
-      if (!await createAnchor(false)) break;
+      if (!await createAnchor(false, null, { anchorInterval, mergeInterval })) break;
       anchorsMade++;
       continue;
     }
@@ -6901,19 +6999,42 @@ async function runMemoryJobQueue() {
       data.processing.queueSources = sources;
       data.processing.queuePending = false;
       saveMemory();
+      const intervalRecheck = sources.some(source => String(source).includes('运行间隔调整'));
 
       const pendingRowsNow = pendingGodlogRows(data);
       const hasSettledHistoricalWork = pendingRowsNow.some(row => isRowSettledForGodlog(row));
       if (generationIsActiveForGodlog(latestAssistantRow()) && !hasSettledHistoricalWork) {
-        scheduleMemoryAfterSettle('发送完成后处理');
+        scheduleMemoryAfterSettle(intervalRecheck ? '运行间隔调整后重新检查' : '发送完成后处理');
         break;
       }
 
       syncGodlogsWithChat(sources.join(' / ') || '队列同步');
-      await createAnchor(false);
+      const anchorInterval = normalizeAnchorInterval(settings().anchorInterval);
+      const mergeInterval = normalizeMergeInterval(settings().mergeInterval);
+      await createAnchor(false, null, { anchorInterval, mergeInterval });
       if (!isSameChatContext(contextToken)) return false;
       // The merge threshold is independent from the segmented-anchor threshold.
-      await maybeMerge(false);
+      await maybeMerge(false, false, mergeInterval);
+
+      // A deliberate interval edit may expose more than one already-ready boundary at once.
+      // Drain only derived-memory work (not an unlimited missing-summary backlog), with a hard cap
+      // so one settings change cannot unexpectedly launch an unbounded number of API requests.
+      const hasSettledPendingGodlogs = pendingGodlogRows(memoryData()).some(row => isRowSettledForGodlog(row));
+      if (intervalRecheck && !hasSettledPendingGodlogs) {
+        for (let pass = 0; pass < 12; pass++) {
+          if (!isSameChatContext(contextToken)) return false;
+          const fresh = memoryData();
+          if (mergeCycleMaterials(fresh).length >= mergeInterval) {
+            if (!await maybeMerge(false, false, mergeInterval)) break;
+            continue;
+          }
+          if (pendingAnchorMaterials(fresh).length >= anchorInterval) {
+            if (!await createAnchor(false, null, { anchorInterval, mergeInterval })) break;
+            continue;
+          }
+          break;
+        }
+      }
     } while (state.jobSources.size > 0 && isSameChatContext(contextToken));
     return true;
   } catch (err) {
@@ -6930,6 +7051,7 @@ async function runMemoryJobQueue() {
     saveMemory(true);
     updatePreview();
     if (state.jobSources.size > 0) queueMemoryJob('队列续跑');
+    flushDeferredIntervalRecheck();
   }
 }
 
@@ -7004,8 +7126,8 @@ function statusText(data = memoryData()) {
     ...Object.keys(data.processing?.mergedKeys || {}),
     ...Object.keys(data.processing?.anchoredKeys || {}),
   ]);
-  const anchorInterval = Math.max(1, Number(s.anchorInterval) || 15);
-  const mergeInterval = Math.max(1, Number(s.mergeInterval) || 100);
+  const anchorInterval = normalizeAnchorInterval(s.anchorInterval);
+  const mergeInterval = normalizeMergeInterval(s.mergeInterval);
   const nextAnchorAt = coveredKeys.size + anchorInterval;
   const anchorRemaining = Math.max(0, nextAnchorAt - currentAiTurn);
   const mergedCount = new Set(latestMerge(data)?.sourceKeys || []).size;
@@ -7368,18 +7490,30 @@ function sanitizeLeakedGodlogDom(messageEl) {
 }
 
 function memoryRefLabel(ref, data = memoryData()) {
-  const kind = ref?.kind === 'merge' ? '全量合并'
-    : ref?.kind === 'anchor' ? `${Math.max(1, Number(settings().anchorInterval) || 15)}回合锚点`
-      : ref?.kind === 'godlog' ? '前情片段'
-        : '记忆';
   const source = ref?.id
     ? [...(data.godlogs || []), ...(data.anchors || []), ...(data.merges || [])].find(item => item.id === ref.id)
     : null;
+  const kind = ref?.kind === 'merge' ? '全量合并'
+    : ref?.kind === 'anchor' ? anchorBatchLabel(source)
+      : ref?.kind === 'godlog' ? '前情片段'
+        : '记忆';
   const title = ref?.title || (ref?.kind === 'godlog' ? godlogFieldValue(source?.body || '', 'Title') : '') || '';
   const number = ref?.kind === 'godlog'
     ? (source?.floor !== undefined ? `第 ${source.floor + 1} 楼` : (ref.number ? `第 ${ref.number} 条` : ''))
     : (source?.number || ref?.number ? `第 ${source?.number || ref.number} 次` : '');
   return [kind, number, title].filter(Boolean).join(' · ');
+}
+
+function memoryRefKindLabel(ref, data = memoryData()) {
+  if (ref?.kind === 'merge') return '全量合并';
+  if (ref?.kind === 'godlog') return '前情片段';
+  if (ref?.kind === 'anchor') {
+    const source = ref?.id
+      ? [...(data.anchors || [])].find(item => item.id === ref.id)
+      : null;
+    return anchorBatchLabel(source);
+  }
+  return '记忆';
 }
 
 function memoryRefBody(ref, data = memoryData()) {
@@ -7808,7 +7942,7 @@ function renderHealth() {
   if (staleAnchors.length > 0) issues.push(`检测到 ${staleAnchors.length} 个旧版过期锚点；重新载入聊天后会自动清理。`);
   if (pendingGodlogRows(data).length > 0) issues.push(`还有 ${pendingGodlogRows(data).length} 楼缺少有效逐楼摘要；配置副API后可自动补写。`);
   if (missingDiagnostics.length > 0) issues.push(`${missingFloors}${missingDiagnostics.length > 5 ? `等 ${missingDiagnostics.length} 楼` : ''}已经落后仍无有效摘要；插件会弹窗提示，并可在“逐楼摘要”页自动补写。`);
-  if (pendingAnchorMaterials(data).length >= Number(s.anchorInterval)) issues.push('有效摘要已达到锚点间隔，可以生成锚点。');
+  if (pendingAnchorMaterials(data).length >= normalizeAnchorInterval(s.anchorInterval)) issues.push('有效摘要已达到锚点间隔，可以生成锚点。');
   const tokenEstimate = estimateMemoryTokens(data);
   const configuredBudget = Math.max(1200, Number(s.memoryMaxTokens) || 8000);
   if (tokenEstimate > configuredBudget) issues.push(`记忆注入估算约 ${tokenEstimate} Token，超过配置上限 ${configuredBudget}；发送前会自动按优先级裁剪。`);
@@ -7881,7 +8015,7 @@ function renderRecallHits() {
       return;
     }
     for (const ref of refs) {
-      const label = ref.kind === 'merge' ? '全量合并' : ref.kind === 'godlog' ? '前情片段' : `${Math.max(1, Number(settings().anchorInterval) || 15)}回合锚点`;
+      const label = memoryRefKindLabel(ref, data);
       const meta = ref.method
         ? `${ref.method}${ref.score ? ` · ${Number(ref.score).toFixed(3)}` : ''}${ref.recallReason ? ` · ${ref.recallReason}` : ''}`
         : '静态注入';
@@ -7901,7 +8035,7 @@ function renderRecallHits() {
     return;
   }
   for (const hit of state.lastRecallMeta) {
-    const label = hit.kind === 'merge' ? '全量合并' : hit.kind === 'godlog' ? '前情片段' : `${Math.max(1, Number(settings().anchorInterval) || 15)}回合锚点`;
+    const label = memoryRefKindLabel(hit, data);
     const body = memoryRefBody(hit, data);
     const position = hit.kind === 'godlog'
       ? `第 ${Number.isInteger(hit.floor) ? hit.floor + 1 : hit.number} 楼`
@@ -8951,8 +9085,8 @@ function bindUi() {
     reconcileStrictRecentWindow('插件启用状态已变化').catch(console.warn);
     injectMemory().catch(console.warn);
   });
-  $('#am_anchor_interval').on('change', function () { saveSetting('anchorInterval', Math.max(5, Number(this.value) || 15)); });
-  $('#am_merge_interval').on('change', function () { saveSetting('mergeInterval', Math.max(30, Number(this.value) || 100)); });
+  $('#am_anchor_interval').on('change', function () { applyIntervalSettingChange('anchorInterval', this.value, this); });
+  $('#am_merge_interval').on('change', function () { applyIntervalSettingChange('mergeInterval', this.value, this); });
   $('#am_keep_recent').on('change', function () {
     saveSetting('keepRecent', Math.max(1, Number(this.value) || 3));
     reconcileStrictRecentWindow('保留轮数设置已变化').catch(console.warn);
@@ -9228,6 +9362,7 @@ function onChatChanged() {
   state.summaryRunning = false;
   state.codexRunning = false;
   state.jobRunning = false;
+  state.pendingIntervalRecheck = false;
   state.activeSummaryRowKey = '';
   invalidateMemoryDataCache();
   invalidateRuntimeCaches('chat changed');

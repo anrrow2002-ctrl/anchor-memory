@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.9.7 - Interval and toast behavior
+
+- Missing-summary warning toasts now use normal SillyTavern tap-to-dismiss behavior and no longer open the workbench on click.
+- New installs default to 15-turn segmented anchors and 75-turn cumulative merges.
+- Runtime interval edits are normalized, persisted, and applied from the next unprocessed batch without deleting existing derived memory.
+- In-flight anchor/merge jobs snapshot their intervals so settings changes cannot alter a batch midway through generation.
+- Interval changes request a deferred queue recheck after active summary/anchor/merge jobs finish.
+- Anchors and merges now persist their actual interval and batch size; historical labels no longer follow the current setting incorrectly.
+- Non-divisible custom intervals remain supported by filling the merge boundary with per-turn summaries.
+
 ## 0.9.6 - Recall before send
 
 - Dynamic recall now starts on the user-message/generation-preparation events and is resolved inside the final prompt-ready hook before the request is released.
