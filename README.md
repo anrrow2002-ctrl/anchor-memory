@@ -1,6 +1,10 @@
-# Anchor Memory 0.9.7 Interval & Toast Fix
+# Anchor Memory 0.9.8 Memory Gap Guard
 
 面向长篇 SillyTavern 角色扮演的分层锚点记忆插件。
+
+## 0.9.8 记忆断层保护
+
+未进入 15 回合锚点的 Godlog 会先转成逐回合紧凑连续索引，避免第六段预算裁掉中间楼层；当个别逐楼摘要失败并离开最近原文窗口后，插件会注入受限保底原文，并允许分段锚点、累计合并继续按时间顺序推进。失败 Godlog 本身仍保持待补写，不会被伪装成已完成摘要。详见 `MEMORY-FLOW-SIMULATION-0.9.8.md`。
 
 ## 本版定位
 

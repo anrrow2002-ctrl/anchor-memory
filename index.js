@@ -143,7 +143,7 @@ function isGenerationActive() {
 
 
 const MODULE = 'anchor_memory';
-const EXTENSION_VERSION = '0.9.7';
+const EXTENSION_VERSION = '0.9.8';
 const DATA_KEY = 'anchorMemory';
 const CORE_PROMPT_KEY = 'anchor_memory_core';
 const RECALL_PROMPT_KEY = 'anchor_memory_recall';
@@ -172,7 +172,10 @@ const STREAM_TAIL_PROBE_MS = 240;
 const PANEL_RENDER_DEBOUNCE_MS = 120;
 const RELATIONSHIP_MEMORY_CHAR_BUDGET = 3600;
 const ANCHOR_EVENT_MEMORY_CHAR_BUDGET = 11000;
-const RECENT_FACTS_MEMORY_CHAR_BUDGET = 4800;
+const RECENT_FACTS_MEMORY_CHAR_BUDGET = 3800;
+const RECENT_READY_SUMMARY_TOTAL_CHAR_BUDGET = 3300;
+const MISSING_RAW_FALLBACK_TOTAL_CHAR_BUDGET = 900;
+const MISSING_RAW_FALLBACK_ANCHOR_TOTAL_CHAR_BUDGET = 18000;
 const DYNAMIC_RECALL_MEMORY_CHAR_BUDGET = 3200;
 // Remote embedding APIs can occasionally be slow. Give semantic recall a short, bounded window
 // before the main request is sent, then fall back to deterministic keyword recall rather than
@@ -2215,6 +2218,19 @@ function safeGodlogMemoryText(body) {
   return sanitizeMainPromptMemoryText(parts.join('\n'));
 }
 
+function compactGodlogMemoryText(body, maxChars = 260) {
+  const title = godlogFieldValue(body, 'Title') || '未命名事件';
+  const time = godlogFieldValue(body, 'Time');
+  const place = godlogFieldValue(body, 'Pln');
+  const content = godlogFieldValue(body, 'Cond') || plainGodlogText(body);
+  const locator = [time, place].filter(Boolean).join(' / ');
+  const prefix = `${locator ? `[${locator}] ` : ''}${title}：`;
+  const budget = Math.max(120, Number(maxChars) || 260);
+  const bodyBudget = Math.max(60, budget - prefix.length);
+  const compact = `${prefix}${clampTextHeadTail(content, bodyBudget, 0.42)}`;
+  return clampTextHeadTail(sanitizeMainPromptMemoryText(compact), budget, 0.42);
+}
+
 function safePromptMemoryText(kind, item, limit = 1800) {
   if (!item) return '';
   const text = kind === 'godlog'
@@ -2552,9 +2568,16 @@ function blockedRebuildGodlogRows(data) {
     .filter(row => !isGodlogReady(godlogForRow(data, row), row));
 }
 
-function anchorMaterialForRow(data, row) {
+function anchorMaterialForRow(data, row, rows = chatRows(true)) {
   const godlog = godlogForRow(data, row);
-  return isGodlogReady(godlog, row) ? { row, godlog, mode: 'godlog' } : null;
+  if (isGodlogReady(godlog, row)) return { row, godlog, mode: 'godlog' };
+  // A failed/pending summary must not permanently freeze every later 15-turn anchor. Keep the
+  // strict chronological boundary, but once the floor has left the recent raw window, use its
+  // authoritative turn text as a bounded emergency material. The normal Godlog remains pending.
+  if (rawFallbackEligible(row, rows)) {
+    return { row, godlog: null, mode: 'raw-fallback', fallbackText: rawFallbackTextForRow(row, 8000) };
+  }
+  return null;
 }
 
 function pendingAnchorMaterials(data) {
@@ -2562,11 +2585,13 @@ function pendingAnchorMaterials(data) {
   const anchored = data.processing.anchoredKeys || {};
   const merged = data.processing.mergedKeys || {};
   const materials = [];
-  // Only a chronological ready prefix may become an anchor. Never skip a missing floor and never
-  // use raw正文 as a silent fallback, otherwise the 15-summary boundary becomes non-deterministic.
-  for (const row of chatRows(true).filter(item => item.role === 'assistant')) {
+  const rows = chatRows(true).filter(item => item.role === 'assistant');
+  // Preserve a chronological prefix. Missing floors inside the recent raw window still wait for
+  // their normal summary; older missing floors use a bounded raw fallback so later memory cannot
+  // cascade into an ever-growing unanchored tail.
+  for (const row of rows) {
     if (merged[row.key] || anchored[row.key]) continue;
-    const material = anchorMaterialForRow(data, row);
+    const material = anchorMaterialForRow(data, row, rows);
     if (!material) break;
     materials.push(material);
   }
@@ -2720,7 +2745,7 @@ function maybeWarnMissingGodlogs(data = memoryData()) {
     ? '插件会继续自动重试；也可在锚点书的“逐楼摘要”页点击“自动补写缺失摘要”立即重跑。'
     : '请先在锚点书中补全副API，再到“逐楼摘要”页点击“自动补写缺失摘要”。';
   const currentSettings = settings();
-  const message = `${floors}${suffix} 没有生成逐楼摘要。${retryText}在摘要补齐前，该楼不会进入每 ${currentSettings.anchorInterval} 个有效AI回合的分段锚点或每 ${currentSettings.mergeInterval} 个有效AI回合的累计合并；若它已超过最近原文窗口，主模型只会看到“摘要缺失”状态，不会重新收到完整旧正文。`;
+  const message = `${floors}${suffix} 没有生成逐楼摘要。${retryText}该楼仍会保持待补写状态；若它离开最近原文窗口，插件会临时注入受限保底原文，并允许后续锚点继续推进，避免一楼失败拖出整段记忆断层。`;
 
   console.warn('[AnchorMemory] missing Godlog rows detected:', issues.map(({ row, item }) => ({
     floor: row.index + 1,
@@ -2739,12 +2764,39 @@ function maybeWarnMissingGodlogs(data = memoryData()) {
   }
 }
 
+function rawFallbackTextForRow(row, maxChars = 1800) {
+  const source = sanitizeMainPromptMemoryText(row?.turnText || row?.text || '');
+  if (!source) return '';
+  return clampTextHeadTail(source, Math.max(320, Number(maxChars) || 1800), 0.38);
+}
+
+function rawFallbackEligible(row, rows = chatRows(true)) {
+  if (!row || row.role !== 'assistant' || !(row.turnText || row.text)) return false;
+  const recentKeys = new Set((rows || [])
+    .filter(item => item.role === 'assistant')
+    .slice(-Math.max(1, Number(settings().keepRecent) || 3))
+    .map(item => item.key));
+  return !recentKeys.has(row.key);
+}
+
 function formatGodlogMaterials(materials) {
+  const fallbackCount = (materials || []).filter(item => item?.mode === 'raw-fallback').length;
+  const fallbackBudget = fallbackCount
+    ? Math.max(2400, Math.floor(MISSING_RAW_FALLBACK_ANCHOR_TOTAL_CHAR_BUDGET / fallbackCount))
+    : 0;
   return (materials || [])
     .map(item => {
       const { row, godlog } = item || {};
-      if (!row || !godlog?.body) return '';
+      if (!row) return '';
       const label = `#${row.index} ${row.sendDate ? `[${row.sendDate}] ` : ''}${row.name || '未命名'}`;
+      if (item.mode === 'raw-fallback') {
+        const fallback = item.fallbackText || rawFallbackTextForRow(row, Math.min(8000, fallbackBudget));
+        if (!fallback) return '';
+        return `${label}
+【逐楼摘要暂缺｜保底原文，仅用于维持本批时间线】
+${fallback}`;
+      }
+      if (!godlog?.body) return '';
       return `${label}
 ${godlog.body}`;
     })
@@ -2823,12 +2875,28 @@ function activeAnchorsAfterMerge(data) {
 
 function mergeCycleMaterials(data) {
   const merged = latestMergeKeySet(data);
+  const rows = chatRows(true).filter(item => item.role === 'assistant');
+  const anchorCovered = new Set(activeAnchorsAfterMerge(data).flatMap(anchor => anchor.sourceKeys || []));
   const result = [];
-  for (const row of chatRows(true).filter(item => item.role === 'assistant')) {
+  for (const row of rows) {
     if (merged.has(row.key)) continue;
     const godlog = godlogForRow(data, row);
-    if (!isGodlogReady(godlog, row)) break;
-    result.push({ row, godlog, mode: 'godlog' });
+    if (isGodlogReady(godlog, row)) {
+      result.push({ row, godlog, mode: 'godlog' });
+      continue;
+    }
+    // Normally the missing row is already represented by a raw-fallback anchor. Retain a bounded
+    // raw copy as a final guard for legacy/cross-boundary anchors or a merge that becomes due first.
+    if (anchorCovered.has(row.key) || rawFallbackEligible(row, rows)) {
+      result.push({
+        row,
+        godlog: null,
+        mode: anchorCovered.has(row.key) ? 'anchor-covered' : 'raw-fallback',
+        fallbackText: rawFallbackTextForRow(row, 8000),
+      });
+      continue;
+    }
+    break;
   }
   return result;
 }
@@ -3771,7 +3839,7 @@ function buildAnchorPrompt(data, materials) {
   const start = rows[0]?.assistantNumber || rows[0]?.index + 1 || 0;
   const end = rows[rows.length - 1]?.assistantNumber || rows[rows.length - 1]?.index + 1 || 0;
 
-  return `你是长篇角色扮演的后台锚点整理员。请只把下面这一批新增逐楼摘要压缩成一个独立锚点。
+  return `你是长篇角色扮演的后台锚点整理员。请只把下面这一批新增记忆材料压缩成一个独立锚点。绝大多数材料是逐楼摘要；若个别楼层标记为“保底原文”，它是摘要失败后的唯一事实来源，必须按原文提取且不得补写。
 
 ${renderTemplate(s.anchorRules || DEFAULT_ANCHOR_RULES)}
 
@@ -3784,7 +3852,7 @@ ${renderTemplate(s.anchorRules || DEFAULT_ANCHOR_RULES)}
 
 本批对应 AI 回合：第 ${start}-${end} 回合。
 
-## 本批新增逐楼摘要
+## 本批新增记忆材料
 ${formatGodlogMaterials(materials)}`;
 }
 
@@ -3805,10 +3873,14 @@ function buildMergePrompt(data, plan, force = false) {
   const blocks = (plan?.blocks || []).map((block, index) => {
     const label = block.kind === 'anchor'
       ? `${anchorBatchLabel(block.item)}：第${block.item?.number || index + 1}次`
-      : `逐楼摘要：第${block.row?.assistantNumber || block.row?.index + 1 || index + 1}回合`;
+      : block.kind === 'raw-fallback'
+        ? `摘要失败保底原文：第${block.row?.assistantNumber || block.row?.index + 1 || index + 1}回合`
+        : `逐楼摘要：第${block.row?.assistantNumber || block.row?.index + 1 || index + 1}回合`;
     const body = block.kind === 'anchor'
       ? safePromptMemoryText('anchor', block.item, 6500)
-      : safePromptMemoryText('godlog', block.item, 1400);
+      : block.kind === 'raw-fallback'
+        ? clampTextHeadTail(block.fallbackText || rawFallbackTextForRow(block.row, 8000), 8000, 0.38)
+        : safePromptMemoryText('godlog', block.item, 1400);
     return `### ${label}\n${body}`;
   }).join('\n\n---\n\n');
 
@@ -3981,22 +4053,39 @@ function buildRecentFactsInjection(data, rows = chatRows(true), options = {}) {
   const recentFactsMeta = [];
   if (commit) state.lastRecentFactsMeta = [];
   refreshCoverageMaps(data);
-  const recentRawKeys = new Set(rows
-    .filter(row => row.role === 'assistant')
+  const assistantRows = rows.filter(row => row.role === 'assistant');
+  const recentRawKeys = new Set(assistantRows
     .slice(-Math.max(1, Number(settings().keepRecent) || 3))
     .map(row => row.key));
   const coveredKeys = new Set([
     ...Object.keys(data.processing?.mergedKeys || {}),
     ...Object.keys(data.processing?.anchoredKeys || {}),
   ]);
-  const entries = rows
-    .filter(row => row.role === 'assistant')
+  const candidates = assistantRows
     .filter(row => !recentRawKeys.has(row.key) && !coveredKeys.has(row.key))
-    .map(row => ({ row, godlog: godlogForRow(data, row) }))
-    .filter(({ row, godlog }) => isGodlogReady(godlog, row))
-    .map(({ row, godlog }) => ({ row, godlog, text: safePromptMemoryText('godlog', godlog, 1000) }))
+    .map(row => ({ row, godlog: godlogForRow(data, row) }));
+  const readyCandidates = candidates.filter(({ row, godlog }) => isGodlogReady(godlog, row));
+  const missing = candidates.filter(({ row, godlog }) => !isGodlogReady(godlog, row) && rawFallbackEligible(row, assistantRows));
+  // The old 1000-char-per-Godlog rendering could exceed the section's token allocation before the
+  // first 15-turn anchor, causing fitMemorySections() to keep only the head and tail and silently
+  // drop middle turns. Allocate a compact per-turn line so every unanchored ready floor remains
+  // represented inside one bounded section.
+  const readyTotalBudget = missing.length
+    ? Math.max(1600, RECENT_READY_SUMMARY_TOTAL_CHAR_BUDGET - MISSING_RAW_FALLBACK_TOTAL_CHAR_BUDGET)
+    : RECENT_READY_SUMMARY_TOTAL_CHAR_BUDGET;
+  const perReadyBudget = readyCandidates.length
+    ? Math.max(150, Math.min(420, Math.floor(readyTotalBudget / readyCandidates.length)))
+    : 0;
+  const entries = readyCandidates
+    .map(({ row, godlog }) => ({ row, godlog, text: compactGodlogMemoryText(godlog.body || '', perReadyBudget) }))
     .filter(entry => entry.text);
-  if (entries.length === 0) return '';
+  const perMissingBudget = missing.length
+    ? Math.max(240, Math.floor(MISSING_RAW_FALLBACK_TOTAL_CHAR_BUDGET / missing.length))
+    : 0;
+  const fallbackEntries = missing
+    .map(({ row }) => ({ row, text: rawFallbackTextForRow(row, perMissingBudget) }))
+    .filter(entry => entry.text);
+  if (entries.length === 0 && fallbackEntries.length === 0) return '';
   recentFactsMeta.push(...entries.map(({ row, godlog }) => injectionRef('godlog', godlog, {
     floor: row.index,
     key: row.key,
@@ -4006,11 +4095,19 @@ function buildRecentFactsInjection(data, rows = chatRows(true), options = {}) {
   if (Array.isArray(options.metaTarget)) options.metaTarget.push(...recentFactsMeta);
   if (commit) state.lastRecentFactsMeta = recentFactsMeta;
   const parts = [`### 逐楼摘要（尚未进入每 ${normalizeAnchorInterval(settings().anchorInterval)} 回合锚点）`];
+  if (fallbackEntries.length) {
+    parts.push('#### 摘要失败楼层的临时保底原文');
+    parts.push('以下只在对应逐楼摘要尚未成功、且原文已离开最近窗口时注入；禁止补写未显示的细节。');
+    for (const { row, text } of fallbackEntries) {
+      parts.push(`##### 第 ${row.assistantNumber || row.index + 1} 个AI回合（保底原文）`);
+      parts.push(text);
+    }
+  }
   for (const { row, text } of entries) {
     parts.push(`#### 第 ${row.assistantNumber || row.index + 1} 个AI回合`);
     parts.push(text);
   }
-  return clampTextHeadTail(parts.join('\n\n'), RECENT_FACTS_MEMORY_CHAR_BUDGET, 0.28);
+  return clampTextHeadTail(parts.join('\n\n'), RECENT_FACTS_MEMORY_CHAR_BUDGET, fallbackEntries.length ? 0.58 : 0.28);
 }
 
 const RECALL_STOP_TERMS = new Set([
@@ -4980,7 +5077,7 @@ async function buildPromptReadyInjection(chat = getContext().chat || [], options
     { id: 'character', minTokens: 260, maxTokens: 1050, weight: 1.1, headRatio: 0.38, text: `【三. ${trackedLabel} 动态演变（核心转变）】\n\n${safeCodexText(characterMemo, 3200)}` },
     { id: 'people', minTokens: 180, maxTokens: 850, weight: 0.8, headRatio: 0.45, text: `【四. 匹配到的出场人物库】\n\n${safeCodexText(matchedPeopleInjectionBlock(data, chat), 2200)}` },
     { id: 'items', minTokens: 180, maxTokens: 900, weight: 0.9, headRatio: 0.45, text: `【五. 重要道具、梗与核心细节】\n\n${safeCodexText(importantItemsInjectionBlock(data, chat), 2400)}` },
-    { id: 'recent', minTokens: 360, maxTokens: 1700, weight: 1.35, headRatio: 0.3, text: sectionSix },
+    { id: 'recent', minTokens: 1400, maxTokens: 3000, weight: 3.6, headRatio: 0.48, text: sectionSix },
   ];
 
   const budget = currentMemoryTokenBudget(chat);
@@ -5846,7 +5943,7 @@ async function enforceAnchorHiddenState(data = memoryData()) {
   if (!Array.isArray(chat) || chat.length === 0) return false;
 
   // “保留最近 N 个 AI 正文”是独立的硬窗口，不再依赖摘要是否成功、是否进入分段锚点。
-  // 摘要失败只能造成记忆缺口，不能让第四轮及以前的完整正文重新泄漏到 chat history。
+  // 摘要失败不能让第四轮及以前的完整正文重新泄漏到 chat history；缺失楼层由独立的受限保底原文段维持连续性。
   const plan = recentRawHistoryPlan(chat);
   const desiredHidden = new Set(
     settings().enabled && settings().autoHide ? plan.hideIndices : [],
@@ -6131,7 +6228,7 @@ async function repairMissingGodlogs(limit = Number.MAX_SAFE_INTEGER) {
     if (okCount === rows.length) {
       toastr?.success?.(`已自动补写 ${okCount} 楼逐楼摘要`, 'Anchor Memory');
     } else {
-      toastr?.warning?.(`已补写 ${okCount}/${rows.length} 楼；未完成的楼层会阻塞后续锚点边界。超过最近正文窗口后，主模型只会收到摘要缺失提示，不会回退发送完整旧正文`, 'Anchor Memory');
+      toastr?.warning?.(`已补写 ${okCount}/${rows.length} 楼；未完成楼层会继续待补写。它离开最近正文窗口后将使用受限保底原文维持时间线，不再永久阻塞后续锚点`, 'Anchor Memory');
     }
     return okCount === rows.length;
   } finally {
@@ -6521,7 +6618,7 @@ async function createAnchorUnlocked(force = false, customMaterials = null, inter
     if (force) toastr?.info?.('没有连续且已完成的未锚定摘要', 'Anchor Memory');
     return false;
   }
-  if (!force && materials.some(item => !isGodlogReady(item.godlog, item.row))) return false;
+  if (!force && materials.some(item => item.mode !== 'raw-fallback' && !isGodlogReady(item.godlog, item.row))) return false;
 
   state.running = true;
   data.processing.busy = true;
@@ -6548,6 +6645,7 @@ async function createAnchorUnlocked(force = false, customMaterials = null, inter
       sourceFloors,
       sourceKeys,
       sourceGodlogIds,
+      rawFallbackKeys: materials.filter(item => item.mode === 'raw-fallback').map(item => item.row.key),
       intervalUsed: interval,
       batchSize: materials.length,
       coveredFloors: coveredRows.map(row => row.index),
@@ -6637,7 +6735,17 @@ async function maybeMergeUnlocked(force = false, intervalOverride = null) {
   }
   for (const material of materials) {
     if (represented.has(material.row.key)) continue;
-    blocks.push({ kind: 'godlog', item: material.godlog, row: material.row, order: rowOrder.get(material.row.key) || 0 });
+    if (material.godlog && isGodlogReady(material.godlog, material.row)) {
+      blocks.push({ kind: 'godlog', item: material.godlog, row: material.row, order: rowOrder.get(material.row.key) || 0 });
+    } else {
+      blocks.push({
+        kind: 'raw-fallback',
+        item: null,
+        row: material.row,
+        fallbackText: material.fallbackText || rawFallbackTextForRow(material.row, 8000),
+        order: rowOrder.get(material.row.key) || 0,
+      });
+    }
   }
   blocks.sort((a, b) => a.order - b.order);
   const plan = { materials, sourceKeys, blocks };
@@ -6661,7 +6769,8 @@ async function maybeMergeUnlocked(force = false, intervalOverride = null) {
       sourceKeys: cumulativeKeys,
       cycleSourceKeys: sourceKeys,
       sourceAnchorIds: blocks.filter(block => block.kind === 'anchor').map(block => block.item.id),
-      sourceGodlogIds: blocks.filter(block => block.kind === 'godlog').map(block => block.item.id),
+      sourceGodlogIds: blocks.filter(block => block.kind === 'godlog' && block.item?.id).map(block => block.item.id),
+      rawFallbackKeys: blocks.filter(block => block.kind === 'raw-fallback').map(block => block.row?.key).filter(Boolean),
       previousMergeId: previous?.id || '',
       intervalUsed: interval,
       cycleSize: sourceKeys.length,
@@ -7194,7 +7303,7 @@ function updatePreview() {
   const replacement = data.processing.lastContextReplacement;
   $('#am_context_window').text(replacement
     ? (replacement.mode === 'prompt-ready-history-hide'
-      ? `最终请求：保留最近 ${replacement.rawKept || replacement.keepRecent || settings().keepRecent} 个AI回合原文；移除旧正文 ${replacement.hiddenBodies || replacement.covered || 0} 条；注入记忆 ${replacement.injectedTokens || estimateTokens(state.lastPromptInjection || '')} Token（预算 ${replacement.memoryBudgetTokens || state.lastMemoryBudget?.budgetTokens || settings().memoryMaxTokens}，${replacement.injectedChars || 0} 字符）/ ${replacement.injectedItems || 0} 个来源；缺摘要 ${replacement.missing || 0} 楼（不会回退发送完整旧正文）`
+      ? `最终请求：保留最近 ${replacement.rawKept || replacement.keepRecent || settings().keepRecent} 个AI回合原文；移除旧正文 ${replacement.hiddenBodies || replacement.covered || 0} 条；注入记忆 ${replacement.injectedTokens || estimateTokens(state.lastPromptInjection || '')} Token（预算 ${replacement.memoryBudgetTokens || state.lastMemoryBudget?.budgetTokens || settings().memoryMaxTokens}，${replacement.injectedChars || 0} 字符）/ ${replacement.injectedItems || 0} 个来源；缺摘要 ${replacement.missing || 0} 楼（只注入受限保底原文，不回退整段旧聊天）`
       : replacement.mode === 'prompt-ready'
         ? `生成前注入记忆 ${replacement.injectedTokens || estimateTokens(state.lastPromptInjection || '')} Token（预算 ${replacement.memoryBudgetTokens || state.lastMemoryBudget?.budgetTokens || settings().memoryMaxTokens}，${replacement.injectedChars || 0} 字符）/ ${replacement.injectedItems || 0} 个来源 / 缺摘要 ${replacement.missing || 0} 楼`
         : replacement.mode === 'history-hide'

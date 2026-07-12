@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.9.8
+
+- 修复单楼逐楼摘要失败后阻塞全部后续锚点的级联记忆断层。
+- 修复第一次 15 回合锚点前，完整逐楼摘要超过第六段预算后头尾裁剪、丢失中间楼层的问题；改为按回合紧凑连续索引。
+- 缺失楼离开最近原文窗口后，使用受限保底原文维持当前主提示词连续性。
+- 分段锚点与累计合并支持保底材料，并记录 `rawFallbackKeys` 供审计。
+- 增加 90 回合、4 回合延迟、永久缺失及运行时改间隔的连续性模拟。
+
 ## 0.9.7 - Interval and toast behavior
 
 - Missing-summary warning toasts now use normal SillyTavern tap-to-dismiss behavior and no longer open the workbench on click.
