@@ -5,10 +5,17 @@
       <div class="am-workbench-title">
         <span class="am-logo-letter" aria-hidden="true">a</span>
         <b>锚点书 Anchor Memory</b>
+        <span id="am_master_state_badge" class="am-master-state-badge">运行中</span>
       </div>
-      <button id="am_close_workbench" class="am-icon-button" title="关闭锚点书" aria-label="关闭锚点书">
-        <i class="fa-solid fa-xmark"></i>
-      </button>
+      <div class="am-workbench-header-actions">
+        <button id="am_master_toggle" class="am-master-toggle" type="button" title="一键暂停锚点书；记忆数据和设置都会保留" aria-pressed="true">
+          <i class="fa-solid fa-power-off" aria-hidden="true"></i>
+          <span>暂停插件</span>
+        </button>
+        <button id="am_close_workbench" class="am-icon-button" title="关闭锚点书" aria-label="关闭锚点书">
+          <i class="fa-solid fa-xmark"></i>
+        </button>
+      </div>
     </div>
     <div class="am-workbench-content">
       <div class="am-tabs">
@@ -58,6 +65,10 @@
 
         <div class="am-note">
           新玩家只要做三步：填副API → 开始聊天 → 必要时保存“记忆档案”。插件会先写逐楼摘要，再攒满间隔生成锚点。
+        </div>
+
+        <div class="am-note">
+          顶部“暂停插件 / 启动插件”是总开关。暂停后不注入记忆、不裁剪旧正文、不发起摘要/锚点/召回请求；已有记忆、API配置与档案全部保留，重新启动后继续使用。
         </div>
 
         <div id="am_health_list" class="am-card-list"></div>

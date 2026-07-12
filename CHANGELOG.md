@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.9.9 - Injection guard and master switch
+
+- Added a backend-independent extension-prompt fallback in the generation interceptor.
+- The final chat-completion prompt hook now removes any fallback/stale Anchor Memory block and inserts one fresh block, preventing both missing memory and duplicate injection.
+- Disabled mode also removes Anchor Memory from final prompt arrays.
+- Added a visible master pause/resume button in the workbench header and extension settings entry.
+- Pausing preserves all stored memory and configuration while stopping injection, hidden-history management, summary/anchor/merge jobs, dynamic recall, timers, queues, and tracked API requests.
+- Anchor-managed hidden messages are restored when the plugin is paused and hidden again according to the configured recent window after resume.
+- Added randomized regression simulations for prompt payload variants, long-chat continuity, recall timing, and 300 pause/resume cycles.
+- Added compact mobile header behavior for the new power control.
+
 ## 0.9.8
 
 - 修复单楼逐楼摘要失败后阻塞全部后续锚点的级联记忆断层。

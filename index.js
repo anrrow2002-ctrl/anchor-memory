@@ -143,7 +143,7 @@ function isGenerationActive() {
 
 
 const MODULE = 'anchor_memory';
-const EXTENSION_VERSION = '0.9.8';
+const EXTENSION_VERSION = '0.9.9';
 const DATA_KEY = 'anchorMemory';
 const CORE_PROMPT_KEY = 'anchor_memory_core';
 const RECALL_PROMPT_KEY = 'anchor_memory_recall';
@@ -326,6 +326,7 @@ const DEFAULT_SETTINGS = {
 
 const state = {
   contextEpoch: 0,
+  pluginToggleEpoch: 0,
   queueTimer: null,
   restoreTimer: null,
   mutationTimer: null,
@@ -477,6 +478,123 @@ function settings() {
 function saveSetting(key, value) {
   settings()[key] = value;
   saveSettingsDebounced();
+}
+
+function clearInjectedPromptState() {
+  setExtensionPrompt(CORE_PROMPT_KEY, '', extension_prompt_types.IN_CHAT, 0);
+  setExtensionPrompt(RECALL_PROMPT_KEY, '', extension_prompt_types.IN_PROMPT, 0);
+  state.lastRecall = '';
+  state.lastRecallMeta = [];
+  state.lastRecallQuery = null;
+  state.lastRecentFacts = '';
+  state.lastRecentFactsMeta = [];
+  state.lastPromptInjection = '';
+  state.lastInjectionRefs = [];
+  state.pendingInjectionContent = '';
+}
+
+function stopRuntimeForPluginPause(reason = 'plugin-paused') {
+  state.requests.abortAll(reason);
+  state.contextEpoch += 1;
+  if (state.queueTimer) clearTimeout(state.queueTimer);
+  if (state.jobTimer) clearTimeout(state.jobTimer);
+  if (state.restoreTimer) clearTimeout(state.restoreTimer);
+  if (state.mutationTimer) clearTimeout(state.mutationTimer);
+  if (state.streamProbeTimer) clearTimeout(state.streamProbeTimer);
+  if (state.codexTimer) clearTimeout(state.codexTimer);
+  clearAllSettleTimers();
+  state.queueTimer = null;
+  state.jobTimer = null;
+  state.restoreTimer = null;
+  state.mutationTimer = null;
+  state.streamProbeTimer = null;
+  state.codexTimer = null;
+  state.running = false;
+  state.anchorPreparing = false;
+  state.mergeRunning = false;
+  state.summaryRunning = false;
+  state.codexRunning = false;
+  state.jobRunning = false;
+  state.pendingIntervalRecheck = false;
+  state.activeSummaryRowKey = '';
+  state.generationLifecycleActive = false;
+  state.generationStartedAt = 0;
+  state.generationEndedAt = 0;
+  state.jobSources.clear();
+  clearRecallPrefetch();
+
+  if (hasPersistentChatContext()) {
+    const data = memoryData();
+    data.processing.busy = false;
+    data.processing.summaryBusy = false;
+    data.processing.codexBusy = false;
+    data.processing.mergeBusy = false;
+    data.processing.queueRunning = false;
+    data.processing.queuePending = false;
+    data.processing.queueSources = [];
+    data.processing.pendingPromptInjection = null;
+    saveMemory(true);
+  }
+}
+
+function syncPluginEnabledUi() {
+  if (!$) return;
+  const enabled = !!settings().enabled;
+  $('#am_enabled').prop('checked', enabled);
+  $('#am_master_toggle')
+    .toggleClass('am-disabled', !enabled)
+    .attr('aria-pressed', String(enabled))
+    .attr('title', enabled
+      ? '一键暂停锚点书；记忆数据和设置都会保留'
+      : '一键启动锚点书并继续使用已有记忆')
+    .find('span').text(enabled ? '暂停插件' : '启动插件');
+  $('#am_master_state_badge').text(enabled ? '运行中' : '已暂停');
+  $('#am_extension_master_toggle')
+    .toggleClass('am-disabled', !enabled)
+    .text(enabled ? '暂停插件' : '启动插件');
+  $('.anchor-memory-settings').toggleClass('am-plugin-disabled', !enabled);
+  $('#anchor_memory_nav_button')
+    .toggleClass('am-disabled', !enabled)
+    .attr('title', enabled ? '锚点书（运行中）' : '锚点书（已暂停，点击打开）');
+}
+
+async function setPluginEnabled(nextEnabled, options = {}) {
+  const next = !!nextEnabled;
+  const s = settings();
+  const previous = !!s.enabled;
+  const toggleEpoch = ++state.pluginToggleEpoch;
+  s.enabled = next;
+  saveSettingsDebounced();
+  syncPluginEnabledUi();
+
+  if (!next) {
+    stopRuntimeForPluginPause('plugin-paused');
+    clearInjectedPromptState();
+    if (hasPersistentChatContext()) {
+      await enforceAnchorHiddenState(memoryData());
+      saveMemory(true);
+    }
+  } else {
+    invalidateRuntimeCaches('plugin resumed');
+    if (hasPersistentChatContext()) {
+      syncGodlogsWithChat('插件重新启动');
+      await enforceAnchorHiddenState(memoryData());
+      if (toggleEpoch !== state.pluginToggleEpoch || !settings().enabled) return settings().enabled;
+      await injectMemory(getContext().chat || []);
+      if (hasPendingMemoryWork()) queueMemoryJob('插件重新启动', 120);
+    }
+    scheduleGodlogPanelRender();
+  }
+
+  // Ignore stale completion from a rapid double-click; the newest requested state owns the UI and toast.
+  if (toggleEpoch !== state.pluginToggleEpoch || settings().enabled !== next) return settings().enabled;
+  syncPluginEnabledUi();
+  safeUpdatePreview(next ? '插件已启动' : '插件已暂停');
+  if (options.notify !== false && previous !== next) {
+    if (next) toastr?.success?.('锚点书已启动：继续注入记忆并处理后续楼层。', 'Anchor Memory');
+    else toastr?.info?.('锚点书已暂停：不会注入、隐藏旧楼或调用后台API；已有记忆和设置均已保留。', 'Anchor Memory');
+  }
+  return next;
 }
 
 function flushDeferredIntervalRecheck() {
@@ -5333,12 +5451,33 @@ async function injectMemoryIntoPromptReady(eventData, secondArg = false) {
   // Prompt Inspector / Prompt List uses a dry run. The old code returned here, so the inspector
   // always displayed full old chatHistory bodies even when real generations were compressed.
   // Apply the same deterministic pruning in dry runs, but do not persist injection bookkeeping.
-  if (!s.enabled || !Array.isArray(promptChat)) return;
+  if (!Array.isArray(promptChat)) return;
+  if (!s.enabled) {
+    removeExistingAnchorMemoryPrompt(promptChat);
+    return;
+  }
+  const operationEpoch = state.contextEpoch;
   try {
     const contextChat = getContext().chat || [];
     const recallResolutionPromise = !dryRun && s.useDynamicRecall
       ? resolveDynamicRecallBeforeSend(contextChat, DYNAMIC_RECALL_PROMPT_WAIT_MS)
       : Promise.resolve(null);
+    // Wait before mutating the real request array. This lets the master pause switch invalidate the
+    // operation cleanly instead of leaving a half-pruned, half-injected prompt behind.
+    const recallResolution = await recallResolutionPromise;
+    if (!settings().enabled || operationEpoch !== state.contextEpoch) {
+      removeExistingAnchorMemoryPrompt(promptChat);
+      return;
+    }
+    const content = await buildPromptReadyInjection(contextChat, {
+      commit: !dryRun,
+      resolvedRecall: recallResolution,
+    });
+    if (!settings().enabled || operationEpoch !== state.contextEpoch) {
+      removeExistingAnchorMemoryPrompt(promptChat);
+      clearInjectedPromptState();
+      return;
+    }
     const replacementStats = applyGodlogContextReplacement(promptChat, {
       mode: 'prompt-ready-history-hide',
       save: false,
@@ -5346,13 +5485,6 @@ async function injectMemoryIntoPromptReady(eventData, secondArg = false) {
     });
     const sanitizedLeaks = sanitizePromptReadyGodlogLeaks(promptChat);
     removeExistingAnchorMemoryPrompt(promptChat);
-    // Horae follows the same ordering: start recall as soon as PROMPT_READY fires, build the other
-    // prompt sections in parallel, then await recall before the final request array is released.
-    const recallResolution = await recallResolutionPromise;
-    const content = await buildPromptReadyInjection(contextChat, {
-      commit: !dryRun,
-      resolvedRecall: recallResolution,
-    });
     let promptRecord = null;
     if (String(content || '').trim()) {
       const insertIndex = resolvePromptInsertIndex(promptChat, normalizedInjectionDepth(s.injectionDepth));
@@ -5396,22 +5528,7 @@ async function injectMemory(chat = getContext().chat || [], options = {}) {
   const s = settings();
   const data = memoryData();
   if (!s.enabled) {
-    setExtensionPrompt(CORE_PROMPT_KEY, '', extension_prompt_types.IN_CHAT, 0);
-    setExtensionPrompt(RECALL_PROMPT_KEY, '', extension_prompt_types.IN_PROMPT, 0);
-    state.lastRecentFactsMeta = [];
-    state.lastRecentFacts = '';
-    state.lastRecall = '';
-    state.lastRecallMeta = [];
-    return;
-  }
-
-  if (usesChatCompletionPromptReady()) {
-    setExtensionPrompt(CORE_PROMPT_KEY, '', extension_prompt_types.IN_CHAT, 0);
-    setExtensionPrompt(RECALL_PROMPT_KEY, '', extension_prompt_types.IN_PROMPT, 0);
-    state.lastRecentFactsMeta = [];
-    state.lastRecentFacts = '';
-    state.lastRecall = '';
-    state.lastRecallMeta = [];
+    clearInjectedPromptState();
     return;
   }
 
@@ -5431,7 +5548,15 @@ async function injectMemory(chat = getContext().chat || [], options = {}) {
   // Use one deterministic block so the six sections keep the same order on every backend.
   setExtensionPrompt(RECALL_PROMPT_KEY, '', extension_prompt_types.IN_PROMPT, 0);
   if (options.generation) {
-    markDynamicRecallInjected('extension-prompt-generate-interceptor', memoryPrompt);
+    markDynamicRecallInjected(
+      usesChatCompletionPromptReady()
+        ? 'extension-prompt-fallback-before-prompt-ready'
+        : 'extension-prompt-generate-interceptor',
+      memoryPrompt,
+    );
+    if (String(memoryPrompt || '').trim()) {
+      rememberPromptInjectionForNextMessage(data, getContext().chat || chat, memoryPrompt);
+    }
     refreshCommittedRecallUi();
   }
 }
@@ -5942,29 +6067,37 @@ async function enforceAnchorHiddenState(data = memoryData()) {
   const chat = getContext().chat || [];
   if (!Array.isArray(chat) || chat.length === 0) return false;
 
-  // “保留最近 N 个 AI 正文”是独立的硬窗口，不再依赖摘要是否成功、是否进入分段锚点。
-  // 摘要失败不能让第四轮及以前的完整正文重新泄漏到 chat history；缺失楼层由独立的受限保底原文段维持连续性。
-  const plan = recentRawHistoryPlan(chat);
-  const desiredHidden = new Set(
-    settings().enabled && settings().autoHide ? plan.hideIndices : [],
-  );
-
-  const toHide = [];
-  const toUnhide = [];
-  for (let index = 0; index < chat.length; index++) {
-    const message = chat[index];
-    if (!message) continue;
-    const managed = isMemoryManagedHidden(message) || (!!message.is_hidden && !!memoryHideMeta(message));
-    if (desiredHidden.has(index)) {
-      if (!managed || !message.is_hidden) toHide.push(index);
-    } else if (managed) {
-      toUnhide.push(index);
-    }
-  }
-
+  // A pause/resume click can happen while SillyTavern is still applying hidden flags. Re-evaluate the
+  // desired mode after each async pass so an older “hide” operation cannot finish after pause and
+  // leave plugin-managed rows hidden. Three passes are enough to absorb a rapid double toggle while
+  // avoiding an unbounded retry loop caused by another extension continuously changing the rows.
   let changed = false;
-  if (toHide.length > 0) changed = await setMessagesHiddenByAnchor(toHide, true, 'recent-window') || changed;
-  if (toUnhide.length > 0) changed = await setMessagesHiddenByAnchor(toUnhide, false, '*') || changed;
+  for (let pass = 0; pass < 3; pass++) {
+    const shouldHide = !!(settings().enabled && settings().autoHide);
+    // “保留最近 N 个 AI 正文”是独立的硬窗口，不再依赖摘要是否成功、是否进入分段锚点。
+    // 摘要失败不能让第四轮及以前的完整正文重新泄漏到 chat history；缺失楼层由独立的受限保底原文段维持连续性。
+    const plan = recentRawHistoryPlan(chat);
+    const desiredHidden = new Set(shouldHide ? plan.hideIndices : []);
+    const toHide = [];
+    const toUnhide = [];
+
+    for (let index = 0; index < chat.length; index++) {
+      const message = chat[index];
+      if (!message) continue;
+      const managed = isMemoryManagedHidden(message) || (!!message.is_hidden && !!memoryHideMeta(message));
+      if (desiredHidden.has(index)) {
+        if (!managed || !message.is_hidden) toHide.push(index);
+      } else if (managed) {
+        toUnhide.push(index);
+      }
+    }
+
+    if (toHide.length > 0) changed = await setMessagesHiddenByAnchor(toHide, true, 'recent-window') || changed;
+    if (toUnhide.length > 0) changed = await setMessagesHiddenByAnchor(toUnhide, false, '*') || changed;
+
+    const currentMode = !!(settings().enabled && settings().autoHide);
+    if (currentMode === shouldHide) return changed;
+  }
   return changed;
 }
 
@@ -5996,7 +6129,7 @@ function syncLatestGodlogPositionFields(data) {
 }
 
 async function generateGodlogForRow(row, force = false) {
-  if (!hasPersistentChatContext()) return false;
+  if (!settings().enabled || !hasPersistentChatContext()) return false;
   if (!row || row.role !== 'assistant') {
     if (row?.role === 'user') removeGodlogBlockFromMessage(row);
     return false;
@@ -6159,7 +6292,7 @@ async function generateGodlogForRow(row, force = false) {
 }
 
 async function processGodlogBacklog(limit = 4) {
-  if (!hasPersistentChatContext()) return false;
+  if (!settings().enabled || !hasPersistentChatContext()) return false;
   if (state.summaryRunning) return false;
   const data = memoryData();
   const contextToken = captureChatContextToken(data);
@@ -6686,6 +6819,10 @@ async function createAnchorUnlocked(force = false, customMaterials = null, inter
 
 
 async function createAnchor(force = false, customMaterials = null, intervalOptions = {}) {
+  if (!settings().enabled) {
+    if (force) toastr?.info?.('锚点书当前已暂停，请先点击顶部“启动插件”。', 'Anchor Memory');
+    return false;
+  }
   if (state.anchorPreparing || state.mergeRunning) {
     if (force) toastr?.warning?.('已有锚点或累计合并任务正在运行，请勿重复点击', 'Anchor Memory');
     return false;
@@ -6823,6 +6960,10 @@ async function maybeMergeUnlocked(force = false, intervalOverride = null) {
 }
 
 async function maybeMerge(force = false, allowDuringAnchor = false, intervalOverride = null) {
+  if (!settings().enabled) {
+    if (force) toastr?.info?.('锚点书当前已暂停，请先点击顶部“启动插件”。', 'Anchor Memory');
+    return false;
+  }
   if (state.mergeRunning || ((state.anchorPreparing || state.running) && !allowDuringAnchor)) {
     if (force) toastr?.warning?.('已有锚点或累计合并任务正在运行，请勿重复点击', 'Anchor Memory');
     return false;
@@ -6848,6 +6989,10 @@ async function maybeMerge(force = false, allowDuringAnchor = false, intervalOver
 }
 
 async function batchInitializeHistory() {
+  if (!settings().enabled) {
+    toastr?.info?.('锚点书当前已暂停，请先点击顶部“启动插件”。', 'Anchor Memory');
+    return;
+  }
   const s = settings();
   const anchorInterval = normalizeAnchorInterval(s.anchorInterval);
   const mergeInterval = normalizeMergeInterval(s.mergeInterval);
@@ -7013,6 +7158,7 @@ function rowByStableKey(key) {
 }
 
 function scheduleMemoryAfterSettle(source = '等待当前楼正文稳定', row = null) {
+  if (!settings().enabled) return;
   const target = row || latestAssistantRow();
   const targetKey = target?.key || '';
   const timerKey = settleTimerKey(target);
@@ -7051,6 +7197,7 @@ async function reconcileStrictRecentWindow(source = '发送前同步最近正文
 }
 
 function onUserMessageRendered() {
+  if (!settings().enabled) return;
   const chat = getContext().chat || [];
   beginDynamicRecallCycle(chat, '用户消息写入后');
   prepareDynamicRecall(chat).catch(err => console.warn('[AnchorMemory] recall prefetch failed', err));
@@ -7062,6 +7209,7 @@ function onUserMessageRendered() {
 }
 
 function onGenerationAfterCommands() {
+  if (!settings().enabled) return;
   // Run before SillyTavern assembles the final prompt so hidden flags affect every backend, not only
   // Chat Completion payloads that emit CHAT_COMPLETION_PROMPT_READY.
   const chat = getContext().chat || [];
@@ -7071,6 +7219,7 @@ function onGenerationAfterCommands() {
 }
 
 function onGenerationStarted() {
+  if (!settings().enabled) return;
   state.generationLifecycleActive = true;
   state.generationStartedAt = Date.now();
   // Do not cancel timers belonging to older edited floors. Their summaries are independent from
@@ -7079,6 +7228,7 @@ function onGenerationStarted() {
 }
 
 function onGenerationFinished(source = '生成结束') {
+  if (!settings().enabled) return;
   state.generationLifecycleActive = false;
   state.generationEndedAt = Date.now();
   if (state.streamProbeTimer) clearTimeout(state.streamProbeTimer);
@@ -7090,7 +7240,7 @@ function onGenerationFinished(source = '生成结束') {
 }
 
 async function runMemoryJobQueue() {
-  if (!hasPersistentChatContext()) return false;
+  if (!settings().enabled || !hasPersistentChatContext()) return false;
   if (state.jobRunning) return false;
   const data = memoryData();
   const contextToken = captureChatContextToken(data);
@@ -7180,6 +7330,7 @@ function queueMemoryJob(source = '消息已变动', delay = 900) {
 }
 
 function scheduleAnchorCheck() {
+  if (!settings().enabled) return;
   // Render events can fire repeatedly while a floor is still streaming or while inline image
   // metadata is being appended. Record the newest fingerprint now, revoke an already-outdated
   // summary immediately, then wait for the source to settle before requesting a replacement.
@@ -7224,6 +7375,9 @@ function registerEventHandlers(names, handler, mode = 'on') {
 
 function statusText(data = memoryData()) {
   const s = settings();
+  if (!s.enabled) {
+    return `${currentCharacterName()}：锚点书已暂停。不会注入记忆、隐藏旧楼或调用后台API；已有逐楼摘要、锚点、人物关系与档案均已保留。`;
+  }
   const assistantRows = chatRows(true).filter(row => row.role === 'assistant');
   const currentAiTurn = assistantRows.length;
   const readyGodlogs = (data.godlogs || []).filter(item => item.status === 'ready').length;
@@ -8848,7 +9002,7 @@ function exportConfig() {
   toastr?.success?.('配置已导出，不包含API密钥和记忆档案', 'Anchor Memory');
 }
 
-function importConfig() {
+async function importConfig() {
   try {
     const imported = JSON.parse($('#am_json_box').val() || '{}');
     const incoming = imported.settings || imported;
@@ -8859,6 +9013,7 @@ function importConfig() {
     }
     saveSettingsDebounced();
     loadUi();
+    await setPluginEnabled(!!s.enabled, { notify: false });
     toastr?.success?.('配置已导入，原API密钥和记忆档案已保留', 'Anchor Memory');
   } catch (err) {
     toastr?.error?.(`配置导入失败：${err.message}`, 'Anchor Memory');
@@ -8982,7 +9137,10 @@ function installExtensionSettingsEntry() {
       <div class="inline-drawer-content">
         <div class="am-extension-entry-row">
           <span>逐楼摘要、分段锚点与累计历史合并（间隔均可配置）</span>
-          <button id="am_open_workbench_from_extensions" type="button" class="menu_button">打开面板</button>
+          <div class="am-extension-entry-actions">
+            <button id="am_extension_master_toggle" type="button" class="menu_button">暂停插件</button>
+            <button id="am_open_workbench_from_extensions" type="button" class="menu_button">打开面板</button>
+          </div>
         </div>
         <small id="am_extension_load_status">插件已加载 · ${EXTENSION_VERSION}</small>
       </div>
@@ -8998,6 +9156,10 @@ function installExtensionSettingsEntry() {
       toastr?.warning?.('面板模板尚未加载，请稍后再试。', 'Anchor Memory');
     }
   });
+  entry.find('#am_extension_master_toggle').on('click', () => {
+    setPluginEnabled(!settings().enabled).catch(err => console.warn('[AnchorMemory] extension toggle failed', err));
+  });
+  syncPluginEnabledUi();
   return true;
 }
 
@@ -9089,6 +9251,10 @@ function installPublicApi() {
     getPromptPreview: async () => buildPromptReadyInjection(getContext().chat || [], { commit: false }),
     getMemoryBudget: () => clonePlainObject(state.lastMemoryBudget || {}),
     getTimelineWarnings: () => clonePlainObject(memoryData().timeline?.warnings || []),
+    isEnabled: () => !!settings().enabled,
+    enable: () => setPluginEnabled(true),
+    disable: () => setPluginEnabled(false),
+    toggle: () => setPluginEnabled(!settings().enabled),
     cancelBackgroundRequests: () => state.requests.abortAll('public-api-cancel'),
   });
 }
@@ -9174,6 +9340,7 @@ function loadUi() {
   $('#am_merge_format').val(renderTemplate(MERGE_FORMAT_HELP));
   $('#am_secondary_fields').show();
   $('#am_embedding_fields').show();
+  syncPluginEnabledUi();
   safeUpdatePreview('加载面板');
 }
 
@@ -9190,9 +9357,10 @@ function bindUi() {
   });
 
   $('#am_enabled').on('change', function () {
-    saveSetting('enabled', this.checked);
-    reconcileStrictRecentWindow('插件启用状态已变化').catch(console.warn);
-    injectMemory().catch(console.warn);
+    setPluginEnabled(this.checked).catch(err => console.warn('[AnchorMemory] settings toggle failed', err));
+  });
+  $('#am_master_toggle').on('click', function () {
+    setPluginEnabled(!settings().enabled).catch(err => console.warn('[AnchorMemory] master toggle failed', err));
   });
   $('#am_anchor_interval').on('change', function () { applyIntervalSettingChange('anchorInterval', this.value, this); });
   $('#am_merge_interval').on('change', function () { applyIntervalSettingChange('mergeInterval', this.value, this); });
@@ -9381,9 +9549,16 @@ function bindUi() {
 
 function restoreCurrentChatState(reason = '切换聊天') {
   if (!hasPersistentChatContext()) return false;
+  installNavbarEntry();
+  syncPluginEnabledUi();
+  if (!settings().enabled) {
+    clearInjectedPromptState();
+    enforceAnchorHiddenState(memoryData()).catch(err => console.warn('[AnchorMemory] paused-state unhide failed', err));
+    safeUpdatePreview(`${reason}（插件已暂停）`);
+    return true;
+  }
   syncGodlogsWithChat(reason);
   safeUpdatePreview(reason);
-  installNavbarEntry();
   scheduleGodlogPanelRender();
   injectMemory().catch(err => console.warn('[AnchorMemory] inject failed', err));
   return true;
@@ -9412,6 +9587,7 @@ function eventMessageIndex(payload) {
 }
 
 function onStreamTokenReceived() {
+  if (!settings().enabled) return;
   // STREAM_TOKEN_RECEIVED fires once per streamed token. The old implementation cleared the whole
   // chat cache and rebuilt every historical row for every token, making cost grow with chat length.
   // Keep this path tail-only and throttled; full reconciliation still runs on MESSAGE_RECEIVED /
@@ -9439,6 +9615,7 @@ function onStreamTokenReceived() {
 }
 
 function onMessageReceived() {
+  if (!settings().enabled) return;
   if (state.streamProbeTimer) clearTimeout(state.streamProbeTimer);
   state.streamProbeTimer = null;
   invalidateRuntimeCaches('message received');
@@ -9447,6 +9624,7 @@ function onMessageReceived() {
 }
 
 function onLatestMessageRendered(payload) {
+  if (!settings().enabled) return;
   const index = eventMessageIndex(payload);
   if (index === null) return;
   const latest = latestAssistantRow();
@@ -9524,6 +9702,7 @@ function onChatChanged() {
 }
 
 function onChatMutated(reason) {
+  if (!settings().enabled) return;
   invalidateRuntimeCaches(reason || 'chat mutated');
   // Swipe/edit/delete events can fire before SillyTavern has committed the new message object.
   // Debounce to the next settled state so the old summary is removed from metadata and UI reliably.
@@ -9542,9 +9721,22 @@ function onChatMutated(reason) {
 
 window.anchorMemory_onGenerate = async (chat, contextSize, abort, type) => {
   if (type === 'quiet') return;
+  if (!settings().enabled) {
+    clearInjectedPromptState();
+    if (Array.isArray(chat)) removeExistingAnchorMemoryPrompt(chat);
+    return;
+  }
+  const operationEpoch = state.contextEpoch;
+  const cancelIfPaused = () => {
+    if (settings().enabled && operationEpoch === state.contextEpoch) return false;
+    clearInjectedPromptState();
+    if (Array.isArray(chat)) removeExistingAnchorMemoryPrompt(chat);
+    return true;
+  };
   if (Number.isFinite(Number(contextSize)) && Number(contextSize) > 0) state.lastContextSize = Number(contextSize);
   // This interceptor is the last backend-independent guard before prompt construction.
   await reconcileStrictRecentWindow('generate interceptor');
+  if (cancelIfPaused()) return;
   const generationChat = chat || [];
   beginDynamicRecallCycle(generationChat, 'generate interceptor');
   // Chat-completion backends have a later final-array hook. Start prefetch here, then let
@@ -9558,10 +9750,12 @@ window.anchorMemory_onGenerate = async (chat, contextSize, abort, type) => {
       recallResolution = await resolveDynamicRecallBeforeSend(generationChat, DYNAMIC_RECALL_PROMPT_WAIT_MS);
     }
   }
+  if (cancelIfPaused()) return;
   await injectMemory(generationChat, {
-    generation: !usesChatCompletionPromptReady(),
+    generation: true,
     resolvedRecall: recallResolution,
   });
+  if (cancelIfPaused()) return;
   if (Array.isArray(chat)) {
     const contextChat = getContext().chat || [];
     // Always apply the cap here as well. CHAT_COMPLETION_PROMPT_READY is a second final-array guard,

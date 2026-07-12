@@ -6,12 +6,29 @@
 }
 
 .am-navbar-button {
+  position: relative;
   display: inline-flex;
   align-items: center;
   justify-content: center;
   min-width: 32px;
   min-height: 32px;
   cursor: pointer;
+}
+
+.am-navbar-button.am-disabled {
+  opacity: 0.56;
+  filter: grayscale(0.75);
+}
+
+.am-navbar-button.am-disabled::after {
+  content: '';
+  position: absolute;
+  width: 18px;
+  height: 2px;
+  border-radius: 999px;
+  background: currentColor;
+  transform: rotate(-45deg);
+  pointer-events: none;
 }
 
 .am-navbar-letter {
@@ -213,6 +230,53 @@
   align-items: center;
   gap: 10px;
   min-width: 0;
+}
+
+.anchor-memory-settings .am-master-state-badge {
+  display: inline-flex;
+  align-items: center;
+  min-height: 22px;
+  padding: 2px 8px;
+  border: 1px solid rgba(255, 255, 255, 0.5);
+  border-radius: 999px;
+  background: rgba(255, 255, 255, 0.16);
+  font-size: 12px;
+  font-weight: 700;
+  white-space: nowrap;
+}
+
+.anchor-memory-settings .am-workbench-header-actions {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.anchor-memory-settings .am-master-toggle {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 7px;
+  min-height: 34px;
+  padding: 6px 11px;
+  border: 1px solid rgba(255, 255, 255, 0.58);
+  border-radius: 7px;
+  background: rgba(255, 255, 255, 0.15);
+  color: #fff;
+  font-weight: 700;
+  cursor: pointer;
+}
+
+.anchor-memory-settings .am-master-toggle:hover {
+  background: rgba(255, 255, 255, 0.25);
+}
+
+.anchor-memory-settings .am-master-toggle.am-disabled {
+  border-color: rgba(255, 224, 224, 0.72);
+  background: rgba(115, 20, 30, 0.38);
+}
+
+.anchor-memory-settings.am-plugin-disabled .am-workbench-header {
+  background: color-mix(in srgb, var(--SmartThemeBlurTintColor, #1f1f1f) 56%, #6f3940);
 }
 
 .anchor-memory-settings .am-icon-button {
@@ -525,6 +589,12 @@
   gap: 0.75rem;
   flex-wrap: wrap;
 }
+#anchor_memory_settings_entry .am-extension-entry-actions {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.5rem;
+  flex-wrap: wrap;
+}
 #anchor_memory_settings_entry #am_extension_load_status {
   display: block;
   margin-top: 0.5rem;
@@ -737,6 +807,17 @@ body.am-workbench-open {
     white-space: nowrap;
   }
 
+
+  .anchor-memory-settings .am-workbench-header-actions {
+    flex: 0 0 auto;
+    gap: 6px;
+  }
+
+  .anchor-memory-settings .am-master-toggle {
+    min-height: 32px;
+    padding: 5px 9px;
+  }
+
   .anchor-memory-settings .am-workbench-content {
     flex: 1 1 auto;
     width: 100%;
@@ -855,7 +936,23 @@ body.am-workbench-open {
   }
 }
 
+@media screen and (max-width: 520px) {
+  .anchor-memory-settings .am-master-state-badge {
+    display: none;
+  }
+}
+
 @media screen and (max-width: 430px) {
+  .anchor-memory-settings .am-master-toggle {
+    width: 34px;
+    min-width: 34px;
+    padding: 5px;
+  }
+
+  .anchor-memory-settings .am-master-toggle span {
+    display: none;
+  }
+
   .anchor-memory-settings .am-workbench-content {
     padding-left: 8px;
     padding-right: 8px;
