@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.9.10 - Timeline guard and cumulative catch-up
+
+- Deferred destructive source deletion while an active summary request is in flight; transient SillyTavern message-object replacement no longer rolls back relationship/codex state.
+- Added multi-key source re-resolution and reuse of an already-generated pending summary body, avoiding duplicate API calls.
+- Rebuilds now ignore only the newest trailing unsummarized suffix while still blocking unsafe interior history gaps.
+- Relationship injection continues from the rolled-back known-good snapshot while a rebuild is pending. Character/people/item indexes also remain injectable when the completed-timeline guard proves the stored snapshot is still within the safe prefix.
+- One-time migrated the legacy stored cumulative interval `100` to `75`.
+- Added bounded automatic draining of every already-due anchor/merge boundary.
+- Rewrote the stock cumulative merge prompt to merge same-day continuous scenes into causal event chains instead of scene-by-scene logs.
+- Manual “merge/rewrite” now rewrites the current cumulative anchor when no new cycle exists, so old verbose merges can adopt the new rules immediately without incrementing the merge count.
+
 ## 0.9.9 - Injection guard and master switch
 
 - Added a backend-independent extension-prompt fallback in the generation interceptor.
