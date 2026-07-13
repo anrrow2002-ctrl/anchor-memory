@@ -40,8 +40,10 @@
             <div id="am_status" class="am-status"></div>
           </div>
           <div class="am-actions">
-            <button id="am_force_anchor">生成锚点</button>
-            <button id="am_force_merge" title="有新增摘要时提前合并；没有新增摘要时按当前规则重写最近一次累计锚点">全量合并/重写</button>
+            <button id="am_force_anchor" title="把当前尚未锚定的有效摘要立即生成一个新的分段锚点">生成新锚点</button>
+            <button id="am_force_merge" title="把当前尚未纳入累计历史的内容立即生成一次新的全量合并">立即全量合并</button>
+            <button id="am_rewrite_latest_anchor" title="按原覆盖楼层重新生成最近一次分段锚点；不会增加编号">重写最近锚点</button>
+            <button id="am_rewrite_latest_merge" title="按原覆盖边界重新生成最近一次全量合并；不会增加编号">重写最近全量合并</button>
             <button id="am_batch_init">初始化历史楼层</button>
             <button id="am_health_check">记忆体检</button>
             <button id="am_open_api_settings">填写API</button>
@@ -96,6 +98,7 @@
           <input id="am_timeline_search" class="text_pole" type="text" placeholder="搜索锚点、人物、物品、原话..." />
           <button id="am_refresh_view">刷新</button>
         </div>
+        <div class="am-note">重写会保留原编号与原覆盖范围，不会新增一条记录。重写旧分段锚点会回滚依赖它的累计合并；重写旧累计合并会回滚其后的合并，随后由后台按顺序补建。生成失败时旧版本不会丢失。</div>
         <div class="am-section-title">分段锚点区（生成间隔以设置页为准）</div>
         <div id="am_new_anchor_list" class="am-card-list"></div>
         <div class="am-section-title">累计历史区（合并间隔以设置页为准）</div>
@@ -106,6 +109,7 @@
         </label>
         <div class="am-actions">
           <button id="am_save_selected_memory">保存选中锚点/合并</button>
+          <button id="am_rewrite_selected_memory">重写选中锚点/合并</button>
           <button id="am_delete_selected_memory">删除选中锚点/合并</button>
         </div>
       </section>

@@ -143,7 +143,7 @@ function isGenerationActive() {
 
 
 const MODULE = 'anchor_memory';
-const EXTENSION_VERSION = '0.9.10';
+const EXTENSION_VERSION = '0.9.11';
 const DATA_KEY = 'anchorMemory';
 const CORE_PROMPT_KEY = 'anchor_memory_core';
 const RECALL_PROMPT_KEY = 'anchor_memory_recall';
@@ -4024,6 +4024,70 @@ ${renderTemplate(s.anchorRules || DEFAULT_ANCHOR_RULES)}
 ${formatGodlogMaterials(materials)}`;
 }
 
+function sourceKeysForAnchorRewrite(data, anchor) {
+  const direct = (anchor?.sourceKeys || []).filter(Boolean);
+  if (direct.length) return [...new Set(direct)];
+  const covered = (anchor?.coveredKeys || []).filter(Boolean);
+  if (covered.length) return [...new Set(covered)];
+  const byId = new Map((data?.godlogs || []).map(item => [item.id, item.key]));
+  return [...new Set((anchor?.sourceGodlogIds || []).map(id => byId.get(id)).filter(Boolean))];
+}
+
+function manualRewriteMaterialsForKeys(data, sourceKeys = []) {
+  const rows = chatRows(true).filter(row => row.role === 'assistant');
+  const rowByKey = new Map(rows.map(row => [row.key, row]));
+  const materials = [];
+  const missingKeys = [];
+  for (const key of [...new Set((sourceKeys || []).filter(Boolean))]) {
+    const row = rowByKey.get(key);
+    if (!row) {
+      missingKeys.push(key);
+      continue;
+    }
+    const godlog = godlogForRow(data, row);
+    if (isGodlogReady(godlog, row)) {
+      materials.push({ row, godlog, mode: 'godlog' });
+      continue;
+    }
+    const fallbackText = rawFallbackTextForRow(row, 8000);
+    if (fallbackText) materials.push({ row, godlog: null, mode: 'raw-fallback', fallbackText });
+    else missingKeys.push(key);
+  }
+  return { materials, missingKeys };
+}
+
+function buildAnchorRewritePrompt(data, anchor, materials, missingKeys = []) {
+  const s = settings();
+  const number = Number(anchor?.number || 1);
+  const rows = (materials || []).map(item => item.row).filter(Boolean);
+  const start = rows[0]?.assistantNumber || rows[0]?.index + 1 || 0;
+  const end = rows[rows.length - 1]?.assistantNumber || rows[rows.length - 1]?.index + 1 || 0;
+  const missingNote = missingKeys.length
+    ? `注意：有 ${missingKeys.length} 个原始楼层已不存在或无法读取。现有锚点只能用于防止关键事实丢失；不得据此扩写新事实。`
+    : '全部原始楼层仍可读取。原始逐楼摘要/保底原文是唯一权威事实来源；现有锚点仅用于核对是否遗漏。';
+
+  return `你是长篇角色扮演的后台锚点整理员。请重新生成下面这一个既有分段锚点。此次操作是“重写”，不是新增锚点：必须保留原编号、原覆盖范围，不得引入覆盖范围之外的新事实。
+
+${renderTemplate(s.anchorRules || DEFAULT_ANCHOR_RULES)}
+
+${missingNote}
+
+输出必须严格采用以下结构，不要添加其他章节：
+
+### 第 ${number} 次锚点记录
+
+**本次新增锚点：**
+* **[时间] - [事件名称]：** 地点；起因；人物；详细过程；重要物品；结果/影响；核心对话原话（必须注明谁说了什么）。
+
+本锚点原覆盖 AI 回合：第 ${start || '未明'}-${end || '未明'} 回合。
+
+## 原始记忆材料
+${formatGodlogMaterials(materials) || '（原始楼层已不可读取，只能依据现有锚点进行保守压缩）'}
+
+## 现有锚点（仅用于防漏核对）
+${clampTextHeadTail(anchor?.body || '', 10000, 0.45)}`;
+}
+
 function anchorBatchSize(anchor = null) {
   const sourceCount = Array.isArray(anchor?.sourceKeys) ? anchor.sourceKeys.length : 0;
   const legacyCount = Array.isArray(anchor?.sourceGodlogIds) ? anchor.sourceGodlogIds.length : 0;
@@ -4092,42 +4156,297 @@ ${renderTemplate(s.mergeRules || DEFAULT_MERGE_RULES)}
 ${clampTextHeadTail(merge?.body || '', 42000, 0.42)}`;
 }
 
-async function rewriteLatestMergeUnlocked(data, contextToken) {
-  const merge = latestMerge(data);
-  if (!merge?.body) return false;
-  showStatus(`正在按新规则重写第 ${merge.number || data.processing?.mergeCount || 1} 次全量合并`);
+function mergePlanBlocksForRewrite(data, sourceKeys = [], materials = []) {
+  const sourceKeySet = new Set(sourceKeys || []);
+  const rowOrder = new Map((sourceKeys || []).map((key, index) => [key, index]));
+  const represented = new Set();
+  const blocks = [];
+
+  for (const anchor of activeAnchors(data)) {
+    const keys = (anchor.sourceKeys || []).filter(Boolean);
+    if (!keys.length || !keys.every(key => sourceKeySet.has(key))) continue;
+    keys.forEach(key => represented.add(key));
+    blocks.push({
+      kind: 'anchor',
+      item: anchor,
+      order: Math.min(...keys.map(key => rowOrder.get(key) ?? Number.MAX_SAFE_INTEGER)),
+    });
+  }
+
+  for (const material of materials || []) {
+    if (!material?.row || represented.has(material.row.key)) continue;
+    if (material.godlog && isGodlogReady(material.godlog, material.row)) {
+      blocks.push({ kind: 'godlog', item: material.godlog, row: material.row, order: rowOrder.get(material.row.key) ?? 0 });
+    } else {
+      blocks.push({
+        kind: 'raw-fallback',
+        item: null,
+        row: material.row,
+        fallbackText: material.fallbackText || rawFallbackTextForRow(material.row, 8000),
+        order: rowOrder.get(material.row.key) ?? 0,
+      });
+    }
+  }
+  return blocks.sort((a, b) => a.order - b.order);
+}
+
+function renderMergeRewriteBlocks(blocks = []) {
+  return blocks.map((block, index) => {
+    const label = block.kind === 'anchor'
+      ? `${anchorBatchLabel(block.item)}：第${block.item?.number || index + 1}次`
+      : block.kind === 'raw-fallback'
+        ? `摘要失败保底原文：第${block.row?.assistantNumber || block.row?.index + 1 || index + 1}回合`
+        : `逐楼摘要：第${block.row?.assistantNumber || block.row?.index + 1 || index + 1}回合`;
+    const body = block.kind === 'anchor'
+      ? safePromptMemoryText('anchor', block.item, 6500)
+      : block.kind === 'raw-fallback'
+        ? clampTextHeadTail(block.fallbackText || rawFallbackTextForRow(block.row, 8000), 8000, 0.38)
+        : safePromptMemoryText('godlog', block.item, 1400);
+    return `### ${label}\n${body}`;
+  }).join('\n\n---\n\n');
+}
+
+function mergeRewriteSourcePlan(data, merge) {
+  const merges = activeMerges(data);
+  const index = merges.findIndex(item => item.id === merge?.id);
+  const previous = merge?.previousMergeId
+    ? merges.find(item => item.id === merge.previousMergeId) || null
+    : (index > 0 ? merges[index - 1] : null);
+  const previousKeys = new Set(previous?.sourceKeys || []);
+  const cycleSourceKeys = Array.isArray(merge?.cycleSourceKeys) && merge.cycleSourceKeys.length
+    ? [...new Set(merge.cycleSourceKeys.filter(Boolean))]
+    : [...new Set((merge?.sourceKeys || []).filter(key => !previousKeys.has(key)))];
+  const source = manualRewriteMaterialsForKeys(data, cycleSourceKeys);
+  const blocks = mergePlanBlocksForRewrite(data, cycleSourceKeys, source.materials);
+  return { previous, cycleSourceKeys, materials: source.materials, missingKeys: source.missingKeys, blocks };
+}
+
+function buildMergeSourceRewritePrompt(data, merge, plan) {
+  const s = settings();
+  const number = Number(merge?.number || 1);
+  const missingNote = plan.missingKeys.length
+    ? `有 ${plan.missingKeys.length} 个本周期原始楼层已不存在或无法读取。必须保守重写，现有累计锚点只可用于防漏，不得扩写新事实。`
+    : '本周期原始材料仍可读取，应以这些材料和上一次累计历史为权威来源，现有版本仅用于核对遗漏。';
+
+  return `你是长篇角色扮演的后台历史压缩员。请重新生成下面这一次既有全量合并。此次操作是“重写”，不是新增一次合并：必须保留原编号和原覆盖边界，不得把后续剧情提前写入。
+
+${renderTemplate(s.mergeRules || DEFAULT_MERGE_RULES)}
+
+无论自定义规则如何，以下压缩约束必须执行：同一剧情日、同一目标或同一核心冲突连续推进的多个场景必须合并为一条因果事件链；禁止按地点切换、吃饭、回家、发消息或每轮对话机械拆条。只有剧情日期、核心矛盾、行动目标或关系阶段发生实质改变时才另起一条。
+
+${missingNote}
+
+输出必须严格采用以下结构，不要添加其他章节：
+
+### 第 ${number} 次全量合并锚点
+
+**历史锚点简述**
+* **[日期/短时间段] - [合并后的主事件名称]：** 起因 -> 连续推进/核心冲突 -> 结果/影响。关键转折、伏笔、道具与必要原话保留并注明说话人。
+
+## 上一次累计历史
+${clampText(plan.previous?.body || '（这是第一次全量合并，没有上一次累计历史）', 12000)}
+
+## 本次原始新增材料（${plan.cycleSourceKeys.length}个AI回合）
+${clampText(renderMergeRewriteBlocks(plan.blocks), 26000) || '（原始新增材料已不可读取）'}
+
+## 当前这一次全量合并（仅用于防漏核对）
+${clampTextHeadTail(merge?.body || '', 10000, 0.42)}`;
+}
+
+function clearRemovedMergeReferences(data, removedIds = []) {
+  const removed = new Set(removedIds.filter(Boolean));
+  if (!removed.size) return;
+  for (const anchor of data.anchors || []) {
+    if (removed.has(anchor.compactedIntoMergeId)) delete anchor.compactedIntoMergeId;
+  }
+}
+
+function rollbackMergesDependingOnKeys(data, sourceKeys = []) {
+  const keySet = new Set(sourceKeys.filter(Boolean));
+  const removed = [];
+  let cascade = false;
+  data.merges = (data.merges || []).filter(merge => {
+    const touches = (merge.sourceKeys || []).some(key => keySet.has(key));
+    if (cascade || touches) {
+      cascade = true;
+      removed.push(merge);
+      removeStoredVector(data, merge.id);
+      return false;
+    }
+    return true;
+  });
+  clearRemovedMergeReferences(data, removed.map(item => item.id));
+  return removed;
+}
+
+function rollbackMergesAfterItem(data, merge) {
+  const index = (data.merges || []).findIndex(item => item.id === merge?.id);
+  if (index < 0) return [];
+  const removed = data.merges.slice(index + 1);
+  for (const item of removed) removeStoredVector(data, item.id);
+  data.merges = data.merges.slice(0, index + 1);
+  clearRemovedMergeReferences(data, removed.map(item => item.id));
+  return removed;
+}
+
+async function rewriteAnchorItemUnlocked(data, anchor, contextToken) {
+  const anchorSourceKeys = sourceKeysForAnchorRewrite(data, anchor);
+  const source = manualRewriteMaterialsForKeys(data, anchorSourceKeys);
+  showStatus(`正在重写第 ${anchor?.number || 1} 次分段锚点`);
   try {
-    const number = Number(merge.number || data.processing?.mergeCount || 1);
-    const body = normalizeMergeBody(await callWriter(buildMergeRewritePrompt(data, merge), 6200), number);
+    const number = Number(anchor?.number || 1);
+    const body = normalizeAnchorBody(await callWriter(buildAnchorRewritePrompt(data, anchor, source.materials, source.missingKeys), 5200), number);
+    if (!isSameChatContext(contextToken)) return false;
+    if (!body || body.trim().length < 100) throw new Error('重写后的锚点内容为空或过短');
+
+    const previousBody = anchor.body;
+    const removedMerges = rollbackMergesDependingOnKeys(data, anchorSourceKeys);
+    anchor.body = body.trim();
+    anchor.rewrittenAt = Date.now();
+    anchor.updatedAt = Date.now();
+    anchor.rewriteCount = Number(anchor.rewriteCount || 0) + 1;
+    anchor.previousBodyHash = stableHash(previousBody);
+    removeStoredVector(data, anchor.id);
+    markCodexDirty(data, '分段锚点被重写');
+    renumberDerivedMemory(data);
+    refreshCoverageMaps(data);
+    saveMemory(true);
+    try { await enforceAnchorHiddenState(data); } catch (err) { console.warn('[AnchorMemory] rewritten anchor hide reconciliation failed', err); }
+    if (!isSameChatContext(contextToken)) return false;
+    try { await embedMemoryItem(data, anchor.id, anchor.body); } catch (embedErr) { console.warn('[AnchorMemory] rewritten anchor embedding failed', embedErr); }
+    if (!isSameChatContext(contextToken)) return false;
+    if (removedMerges.length) queueMemoryJob('锚点重写后重建累计合并', 180);
+    safeUpdatePreview('分段锚点重写后刷新');
+    if (state.selectedMemoryId === anchor.id) $('#am_timeline_detail').val(anchor.body);
+    toastr?.success?.(`第 ${number} 次分段锚点已重写${removedMerges.length ? `；已回滚 ${removedMerges.length} 个依赖合并并等待重建` : ''}`, 'Anchor Memory');
+    return true;
+  } catch (err) {
+    if (!isSameChatContext(contextToken)) return false;
+    data.processing.lastError = err.message || String(err);
+    saveMemory();
+    toastr?.error?.(`分段锚点重写失败，旧版本仍保留：${err.message}`, 'Anchor Memory');
+    return false;
+  } finally {
+    if (isSameChatContext(contextToken)) showStatus(statusText(data));
+  }
+}
+
+async function rewriteMergeItemUnlocked(data, merge, contextToken) {
+  const plan = mergeRewriteSourcePlan(data, merge);
+  showStatus(`正在重写第 ${merge?.number || 1} 次全量合并`);
+  try {
+    const number = Number(merge?.number || 1);
+    const prompt = plan.cycleSourceKeys.length
+      ? buildMergeSourceRewritePrompt(data, merge, plan)
+      : buildMergeRewritePrompt(data, merge);
+    const body = normalizeMergeBody(await callWriter(prompt, 6200), number);
     if (!isSameChatContext(contextToken)) return false;
     if (!body || body.trim().length < 120) throw new Error('重写后的合并内容为空或过短');
+
     const previousBody = merge.body;
+    const removedLater = rollbackMergesAfterItem(data, merge);
     merge.body = body.trim();
     merge.rewrittenAt = Date.now();
     merge.updatedAt = Date.now();
     merge.rewriteCount = Number(merge.rewriteCount || 0) + 1;
     merge.previousBodyHash = stableHash(previousBody);
     removeStoredVector(data, merge.id);
-    data.processing.lastError = '';
+    markCodexDirty(data, '累计历史锚点被重写');
+    renumberDerivedMemory(data);
+    refreshCoverageMaps(data);
     saveMemory(true);
-    try {
-      await embedMemoryItem(data, merge.id, merge.body);
-    } catch (embedErr) {
-      console.warn('[AnchorMemory] rewritten merge embedding failed; keeping rewritten text', embedErr);
-    }
+    try { await enforceAnchorHiddenState(data); } catch (err) { console.warn('[AnchorMemory] rewritten merge hide reconciliation failed', err); }
     if (!isSameChatContext(contextToken)) return false;
+    try { await embedMemoryItem(data, merge.id, merge.body); } catch (embedErr) { console.warn('[AnchorMemory] rewritten merge embedding failed', embedErr); }
+    if (!isSameChatContext(contextToken)) return false;
+    if (removedLater.length) queueMemoryJob('全量合并重写后重建后续合并', 180);
     safeUpdatePreview('累计合并重写后刷新');
-    toastr?.success?.(`第 ${number} 次全量合并已按当前压缩规则重写`, 'Anchor Memory');
+    if (state.selectedMemoryId === merge.id) $('#am_timeline_detail').val(merge.body);
+    toastr?.success?.(`第 ${number} 次全量合并已重写${removedLater.length ? `；已回滚后续 ${removedLater.length} 次合并并等待重建` : ''}`, 'Anchor Memory');
     return true;
   } catch (err) {
     if (!isSameChatContext(contextToken)) return false;
     data.processing.lastError = err.message || String(err);
     saveMemory();
-    toastr?.error?.(`累计合并重写失败，旧版本仍保留：${err.message}`, 'Anchor Memory');
+    toastr?.error?.(`全量合并重写失败，旧版本仍保留：${err.message}`, 'Anchor Memory');
     return false;
   } finally {
     if (isSameChatContext(contextToken)) showStatus(statusText(data));
   }
+}
+
+async function rewriteMemoryItem(id) {
+  if (!hasPersistentChatContext()) {
+    toastr?.info?.('当前没有可写入记忆的聊天，请先打开一个角色聊天。', 'Anchor Memory');
+    return false;
+  }
+  if (!settings().enabled) {
+    toastr?.info?.('锚点书当前已暂停，请先点击顶部“启动插件”。', 'Anchor Memory');
+    return false;
+  }
+  const found = findMemoryItem(id);
+  if (!found) {
+    toastr?.warning?.('找不到要重写的锚点或全量合并', 'Anchor Memory');
+    return false;
+  }
+  if (state.anchorPreparing || state.mergeRunning || state.running) {
+    toastr?.warning?.('已有锚点、重写或全量合并任务正在运行，请勿重复点击', 'Anchor Memory');
+    return false;
+  }
+
+  const operationEpoch = state.contextEpoch;
+  const contextToken = captureChatContextToken(found.data);
+  if (found.kind === 'anchor') state.anchorPreparing = true;
+  else state.mergeRunning = true;
+  if (found.data?.processing) {
+    if (found.kind === 'anchor') found.data.processing.busy = true;
+    else found.data.processing.mergeBusy = true;
+    saveMemory();
+  }
+  try {
+    return found.kind === 'anchor'
+      ? await rewriteAnchorItemUnlocked(found.data, found.item, contextToken)
+      : await rewriteMergeItemUnlocked(found.data, found.item, contextToken);
+  } finally {
+    if (state.contextEpoch === operationEpoch) {
+      if (found.kind === 'anchor') state.anchorPreparing = false;
+      else state.mergeRunning = false;
+    }
+    if (found.data?.processing && isSameChatContext(contextToken)) {
+      if (found.kind === 'anchor') found.data.processing.busy = false;
+      else found.data.processing.mergeBusy = false;
+      saveMemory(true);
+    }
+    flushDeferredIntervalRecheck();
+  }
+}
+
+async function rewriteLatestAnchor() {
+  const data = memoryData();
+  const anchor = latestAnchor(data);
+  if (!anchor) {
+    toastr?.info?.('当前还没有可重写的分段锚点', 'Anchor Memory');
+    return false;
+  }
+  return rewriteMemoryItem(anchor.id);
+}
+
+async function rewriteLatestMerge() {
+  const data = memoryData();
+  const merge = latestMerge(data);
+  if (!merge) {
+    toastr?.info?.('当前还没有可重写的全量合并', 'Anchor Memory');
+    return false;
+  }
+  return rewriteMemoryItem(merge.id);
+}
+
+async function rewriteSelectedMemory() {
+  if (!state.selectedMemoryId) {
+    toastr?.warning?.('请先在记忆库选择一条分段锚点或全量合并', 'Anchor Memory');
+    return false;
+  }
+  return rewriteMemoryItem(state.selectedMemoryId);
 }
 
 function recentNarrativeQuery(chat = getContext().chat || [], limit = 6) {
@@ -7136,11 +7455,7 @@ async function maybeMergeUnlocked(force = false, intervalOverride = null) {
   if (!force && cycle.length < interval) return false;
   const materials = force ? cycle : cycle.slice(0, interval);
   if (materials.length === 0) {
-    // Manual action with no new cycle becomes an explicit transactional rewrite of the current
-    // cumulative merge. This lets upgraded chats immediately apply the new same-day compression
-    // rules instead of waiting until the next 75-turn boundary. A failed rewrite keeps the old body.
-    if (force && latestMerge(data)?.body) return rewriteLatestMergeUnlocked(data, contextToken);
-    if (force) toastr?.info?.('没有可合并的新摘要，也没有可重写的累计锚点', 'Anchor Memory');
+    if (force) toastr?.info?.('没有新的逐楼摘要可做全量合并；如需改写旧内容，请使用“重写最近全量合并”或记忆库中的“重写选中内容”。', 'Anchor Memory');
     return false;
   }
 
@@ -8397,7 +8712,7 @@ function renderMemoryCards(container, items, emptyText) {
   const assistantRowsByKey = new Map(chatRows(true)
     .filter(row => row.role === 'assistant')
     .map(row => [row.key, row]));
-  for (const { type, item } of items) {
+  for (const { type, kind, item } of items) {
     const fullBody = cleanText(item.body);
     const previewLimit = 600;
     const excerpt = fullBody.slice(0, previewLimit);
@@ -8418,8 +8733,11 @@ function renderMemoryCards(container, items, emptyText) {
           <span>${escapeHtml(type)} · 第 ${escapeHtml(item.number)} 次</span>
           <span class="am-pill">${escapeHtml(item.stale ? '可能过期' : range)}</span>
         </div>
-        <div class="am-card-meta">${new Date(item.createdAt).toLocaleString()}${previewOnly ? ' · 卡片仅预览，点击后在下方查看全文' : ''}</div>
+        <div class="am-card-meta">${new Date(item.createdAt).toLocaleString()}${item.rewriteCount ? ` · 已重写 ${Number(item.rewriteCount)} 次` : ''}${previewOnly ? ' · 卡片仅预览，点击后在下方查看全文' : ''}</div>
         <div class="am-card-body">${escapeHtml(excerpt)}${previewOnly ? '\n\n【预览到此；存储正文未截断】' : ''}</div>
+        <div class="am-card-actions">
+          <button class="am-rewrite-memory" data-memory-id="${escapeHtml(item.id)}">重写此${kind === 'merge' ? '全量合并' : '分段锚点'}</button>
+        </div>
       </div>
     `);
   }
@@ -8431,11 +8749,11 @@ function renderTimelineList() {
   const matches = item => !query || String(item.body || '').toLowerCase().includes(query);
   const newAnchors = activeAnchorsAfterMerge(data)
     .filter(matches)
-    .map(item => ({ type: '新锚点', item }))
+    .map(item => ({ type: '分段锚点', kind: 'anchor', item }))
     .sort((a, b) => b.item.createdAt - a.item.createdAt);
   const oldAnchors = data.merges
     .filter(matches)
-    .map(item => ({ type: '旧锚点', item }))
+    .map(item => ({ type: '全量合并', kind: 'merge', item }))
     .sort((a, b) => b.item.createdAt - a.item.createdAt);
 
   renderMemoryCards($('#am_new_anchor_list'), newAnchors, '暂无新锚点。攒满有效摘要后会自动生成。');
@@ -9700,6 +10018,8 @@ function bindUi() {
   $('#am_apply_siliconflow_embedding').on('click', applySiliconFlowEmbeddingPreset);
   $('#am_force_anchor').on('click', () => createAnchor(true));
   $('#am_force_merge').on('click', () => maybeMerge(true));
+  $('#am_rewrite_latest_anchor').on('click', rewriteLatestAnchor);
+  $('#am_rewrite_latest_merge').on('click', rewriteLatestMerge);
   $('#am_batch_init').on('click', batchInitializeHistory);
   $('#am_health_check').on('click', () => {
     const result = repairHealth();
@@ -9747,7 +10067,15 @@ function bindUi() {
     const item = [...data.anchors, ...data.merges].find(entry => entry.id === id);
     $('#am_timeline_detail').val(item?.body || '');
   });
+  $('#am_new_anchor_list, #am_old_anchor_list, #am_timeline_list').on('click', '.am-rewrite-memory', function (event) {
+    event.preventDefault();
+    event.stopPropagation();
+    const id = $(this).data('memory-id');
+    state.selectedMemoryId = id;
+    rewriteMemoryItem(id);
+  });
   $('#am_save_selected_memory').on('click', saveSelectedMemory);
+  $('#am_rewrite_selected_memory').on('click', rewriteSelectedMemory);
   $('#am_delete_selected_memory').on('click', deleteSelectedMemory);
   $('#am_rebuild_codex').on('click', rebuildCodexFromGodlogs);
   $('#am_restore_codex_backup').on('click', () => restoreCodexBackup(memoryData(), true));
