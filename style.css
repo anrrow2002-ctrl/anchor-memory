@@ -972,3 +972,9 @@ body.am-workbench-open {
     font-size: 18px;
   }
 }
+
+.anchor-memory-settings button:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+  filter: grayscale(0.35);
+}

@@ -143,7 +143,7 @@ function isGenerationActive() {
 
 
 const MODULE = 'anchor_memory';
-const EXTENSION_VERSION = '0.9.11';
+const EXTENSION_VERSION = '0.9.12';
 const DATA_KEY = 'anchorMemory';
 const CORE_PROMPT_KEY = 'anchor_memory_core';
 const RECALL_PROMPT_KEY = 'anchor_memory_recall';
@@ -344,6 +344,7 @@ const state = {
   running: false,
   anchorPreparing: false,
   mergeRunning: false,
+  archiveRunning: false,
   summaryRunning: false,
   activeSummaryRowKey: '',
   codexRunning: false,
@@ -540,6 +541,7 @@ function stopRuntimeForPluginPause(reason = 'plugin-paused') {
   state.running = false;
   state.anchorPreparing = false;
   state.mergeRunning = false;
+  state.archiveRunning = false;
   state.summaryRunning = false;
   state.codexRunning = false;
   state.jobRunning = false;
@@ -627,7 +629,7 @@ async function setPluginEnabled(nextEnabled, options = {}) {
 
 function flushDeferredIntervalRecheck() {
   if (!state.pendingIntervalRecheck) return;
-  if (state.running || state.anchorPreparing || state.mergeRunning || state.jobRunning || state.summaryRunning || state.codexRunning) return;
+  if (state.running || state.anchorPreparing || state.mergeRunning || state.archiveRunning || state.jobRunning || state.summaryRunning || state.codexRunning) return;
   state.pendingIntervalRecheck = false;
   queueMemoryJob('运行间隔调整后重新检查', 0);
 }
@@ -7865,7 +7867,7 @@ async function drainDueDerivedMemory(anchorInterval, mergeInterval, maxPasses = 
 
 async function runMemoryJobQueue() {
   if (!settings().enabled || !hasPersistentChatContext()) return false;
-  if (state.jobRunning) return false;
+  if (state.jobRunning || state.archiveRunning) return false;
   const data = memoryData();
   const contextToken = captureChatContextToken(data);
   const operationEpoch = state.contextEpoch;
@@ -8761,6 +8763,40 @@ function renderTimelineList() {
   $('#am_timeline_list').empty();
 }
 
+function archiveIsTransferReady(archive) {
+  if (!archive || !archive.data) return false;
+  if (archive.mode === 'full-merge') return (archive.data.merges || []).length === 1;
+  // Structural fallback for archives created by an early test build of this feature.
+  return (archive.data.godlogs || []).length === 0
+    && (archive.data.anchors || []).length === 0
+    && (archive.data.merges || []).length === 1;
+}
+
+function archiveMatchesCurrentChat(archive, data = null) {
+  if (!archive?.sourceStorageId || !hasPersistentChatContext()) return false;
+  const current = data || memoryData();
+  return String(archive.sourceStorageId) === String(current?.processing?.storageId || '');
+}
+
+function archiveCoverageCount(archive) {
+  const merges = archive?.data?.merges || [];
+  const merge = merges[merges.length - 1] || null;
+  return Number(archive?.sourceAiTurns || merge?.archivedCoverageCount || merge?.coverageCount || 0);
+}
+
+function inheritedArchiveCoverageCount(data) {
+  const imported = Number(data?.processing?.archiveSourceAiTurns || 0);
+  const mergeBase = Math.max(0, ...(data?.merges || [])
+    .filter(item => item?.archiveBase)
+    .map(item => Number(item.archivedCoverageCount || 0)));
+  return Math.max(imported, mergeBase);
+}
+
+function currentTransferCoverageCount(data = memoryData()) {
+  const currentTurns = chatRows(true).filter(row => row.role === 'assistant').length;
+  return inheritedArchiveCoverageCount(data) + currentTurns;
+}
+
 function renderArchiveCards() {
   const s = settings();
   const charName = currentCharacterName();
@@ -8770,19 +8806,31 @@ function renderArchiveCards() {
   container.empty();
   const names = Object.keys(archives).sort();
   if (names.length === 0) {
-    container.append('<div class="am-card"><div class="am-card-body">当前角色暂无记忆档案。保存一次后，新开场白就能加载这份记忆。</div></div>');
+    container.append('<div class="am-card"><div class="am-card-body">当前角色暂无记忆档案。先保存当前档案，卡片中会出现“补齐摘要并全量合并”按钮；整理完成后才能安全加载到新开场。</div></div>');
     return;
   }
+  const current = hasPersistentChatContext() ? memoryData() : null;
   for (const name of names) {
     const archive = archives[name];
     const d = archive.data || {};
+    const ready = archiveIsTransferReady(archive);
+    const sameSource = archiveMatchesCurrentChat(archive, current);
+    const status = ready ? '已全量整理' : '待全量整理';
+    const counts = ready
+      ? `已压成 1 份累计全量记忆，原覆盖约 ${archiveCoverageCount(archive)} 个AI回合；旧逐楼摘要与旧分段锚点不会带入新开场。`
+      : `当前快照含摘要 ${d.godlogs?.length || 0} 条、锚点 ${d.anchors?.length || 0} 个、全量合并 ${d.merges?.length || 0} 个。请在原聊天中补齐摘要并做最终全量合并。`;
+    const finalizeLabel = ready ? '用当前聊天更新全量合并' : '补齐摘要并全量合并';
+    const finalizeTitle = sameSource
+      ? '补齐当前聊天所有缺失逐楼摘要，把尚未并入累计历史的内容做最后一次全量合并，并更新此档案'
+      : '此档案不是从当前聊天保存的；请回到原聊天，或在当前聊天重新保存一个档案后再整理';
     container.append(`
       <div class="am-card">
-        <div class="am-card-title"><span>${escapeHtml(name)}</span><span class="am-pill">${escapeHtml(charName)}</span></div>
-        <div class="am-card-meta">更新于 ${new Date(archive.updatedAt || Date.now()).toLocaleString()}</div>
-        <div class="am-card-body">摘要 ${d.godlogs?.length || 0} 条，锚点 ${d.anchors?.length || 0} 个，全量合并 ${d.merges?.length || 0} 个，向量 ${Object.keys(d.vectorRefs || d.vectors || {}).length} 条。</div>
+        <div class="am-card-title"><span>${escapeHtml(name)}</span><span class="am-pill">${escapeHtml(status)}</span></div>
+        <div class="am-card-meta">${escapeHtml(charName)} · 更新于 ${new Date(archive.updatedAt || Date.now()).toLocaleString()}</div>
+        <div class="am-card-body">${escapeHtml(counts)}</div>
         <div class="am-card-actions">
-          <button class="am-load-archive" data-archive="${escapeHtml(name)}">加载到当前聊天</button>
+          <button class="am-finalize-archive" data-archive="${escapeHtml(name)}" title="${escapeHtml(finalizeTitle)}" ${sameSource ? '' : 'disabled'}>${escapeHtml(finalizeLabel)}</button>
+          <button class="am-load-archive" data-archive="${escapeHtml(name)}" ${ready ? '' : 'disabled'} title="${ready ? '仅加载最终累计全量记忆与人物、物品、场景状态' : '请先完成全量整理'}">${ready ? '加载到当前聊天' : '需先全量整理'}</button>
           <button class="am-delete-archive" data-archive="${escapeHtml(name)}">删除</button>
         </div>
       </div>
@@ -9186,43 +9234,220 @@ function saveArchive() {
   const s = settings();
   const charName = currentCharacterName();
   const archiveName = ($('#am_archive_name').val() || '主线').trim();
+  const data = memoryData();
+  const sourceStorageId = ensureVectorStorageId(data);
   if (!s.slots[charName]) s.slots[charName] = {};
   s.slots[charName][archiveName] = {
     updatedAt: Date.now(),
-    data: compactArchiveSnapshot(memoryData()),
+    mode: 'snapshot',
+    sourceStorageId,
+    sourceAiTurns: currentTransferCoverageCount(data),
+    data: compactArchiveSnapshot(data),
   };
+  saveMemory(true);
   saveSettingsDebounced();
   renderArchiveCards();
-  toastr?.success?.(`已保存记忆档案：${charName} / ${archiveName}`, 'Anchor Memory');
+  toastr?.success?.(`已保存记忆档案：${charName} / ${archiveName}。请在档案卡片点击“补齐摘要并全量合并”，整理完成后再转入新开场。`, 'Anchor Memory', {
+    timeOut: 9000,
+    extendedTimeOut: 4000,
+    closeButton: true,
+    tapToDismiss: true,
+  });
 }
 
-function portableArchiveData(data) {
-  const loaded = JSON.parse(JSON.stringify(data || defaultData()));
-  loaded.godlogs = (loaded.godlogs || []).map(item => ({
-    ...item,
-    archived: true,
-    status: item.status === 'ready' ? 'ready' : item.status,
-  }));
-  loaded.processing = {
+function transferMergeSnapshot(merge, archivedCoverageCount = 0) {
+  if (!merge) return null;
+  const body = String(merge.body || '').replace(/^###\s*第\s*\d+\s*次全量合并锚点/m, '### 第 1 次全量合并锚点');
+  return {
+    ...JSON.parse(JSON.stringify(merge)),
+    id: `am_archive_merge_${Date.now()}_${stableHash(body).slice(0, 6)}`,
+    number: 1,
+    body,
+    sourceKeys: [],
+    cycleSourceKeys: [],
+    sourceAnchorIds: [],
+    sourceGodlogIds: [],
+    rawFallbackKeys: [],
+    previousMergeId: '',
+    intervalUsed: normalizeMergeInterval(settings().mergeInterval),
+    cycleSize: 0,
+    coverageCount: 0,
+    archivedCoverageCount: Number(archivedCoverageCount || merge.coverageCount || merge.sourceKeys?.length || 0),
+    floorAt: -1,
+    archiveBase: true,
+    createdAt: Date.now(),
+  };
+}
+
+function buildTransferArchiveSnapshot(data) {
+  const snapshot = compactArchiveSnapshot(data);
+  const finalMerge = latestMerge(snapshot);
+  if (!finalMerge?.body) throw new Error('当前没有可用于转档的累计全量合并');
+  const archivedCoverageCount = Math.max(
+    Number(finalMerge.coverageCount || 0),
+    Number(finalMerge.sourceKeys?.length || 0),
+    currentTransferCoverageCount(data),
+  );
+  const transferMerge = transferMergeSnapshot(finalMerge, archivedCoverageCount);
+  snapshot.godlogs = [];
+  snapshot.anchors = [];
+  snapshot.merges = [transferMerge];
+  snapshot.messageGodlogs = {};
+  snapshot.messageRecalls = {};
+  snapshot.vectorRefs = {};
+  snapshot.vectors = {};
+  snapshot.codexBackup = null;
+  snapshot.relationshipTable = normalizeRelationshipTable(snapshot.relationshipTable, snapshot.codex?.relationship || '');
+  snapshot.relationshipTable.history = [];
+  snapshot.relationshipTable.lastGoodFloor = -1;
+  snapshot.relationshipTable.lastGoodKey = '';
+  snapshot.timeline = {
+    ...(snapshot.timeline || defaultData().timeline),
+    currentSourceKey: '',
+    currentFloor: -1,
+    warnings: [],
+    history: [],
+    updatedAt: Date.now(),
+  };
+  snapshot.processing = {
     ...defaultData().processing,
-    ...(loaded.processing || {}),
-    anchoredKeys: {},
+    storageId: '',
+    godlogCount: 0,
+    anchorCount: 0,
+    mergeCount: 1,
     lastAnchorFloor: -1,
     lastMergeFloor: -1,
-    pendingPromptInjection: null,
-    busy: false,
-    summaryBusy: false,
-    lastContextReplacement: null,
-    lastError: '',
+    archiveImported: false,
+  };
+  return snapshot;
+}
+
+async function finalizeArchiveForTransfer(archiveName = '') {
+  const s = settings();
+  const charName = currentCharacterName();
+  archiveName = archiveName || $('#am_archive_name').val().trim();
+  const archive = s.slots?.[charName]?.[archiveName];
+  if (!archiveName || !archive) {
+    toastr?.warning?.(`找不到 ${charName} 的这个记忆档案`, 'Anchor Memory');
+    return false;
+  }
+  if (!settings().enabled) {
+    toastr?.warning?.('锚点书当前已暂停，请先启动插件再整理档案。', 'Anchor Memory');
+    return false;
+  }
+  const data = memoryData();
+  if (!archiveMatchesCurrentChat(archive, data)) {
+    toastr?.warning?.('这个档案不是从当前聊天保存的，无法在这里补写原楼层摘要。请回到原聊天，或在当前聊天重新保存一个档案。', 'Anchor Memory');
+    return false;
+  }
+  if (state.archiveRunning || state.running || state.anchorPreparing || state.mergeRunning || state.summaryRunning || state.jobRunning || data.processing?.busy || data.processing?.summaryBusy || data.processing?.mergeBusy) {
+    toastr?.warning?.('已有摘要、锚点、合并或归档整理任务正在运行，请完成当前任务后再点击。', 'Anchor Memory');
+    return false;
+  }
+  if (generationIsActiveForGodlog(latestAssistantRow())) {
+    toastr?.warning?.('当前AI回复仍在生成，不能归档最终版本；请在本楼正文完成后再点击。', 'Anchor Memory');
+    return false;
+  }
+  const pendingCount = missingGodlogRepairRows(data).length;
+  const unmergedCount = mergeCycleMaterials(data).length;
+  if ((pendingCount > 0 || unmergedCount > 0) && (!s.useSecondary || !s.secondaryUrl || !s.secondaryKey)) {
+    toastr?.warning?.('当前档案仍有待补摘要或待合并内容，请先配置并启用副API后再整理。', 'Anchor Memory');
+    return false;
+  }
+  if (!latestMerge(data)?.body && unmergedCount === 0) {
+    toastr?.warning?.('当前聊天没有可整理的累计记忆。', 'Anchor Memory');
+    return false;
+  }
+  if (!confirm(`将整理档案「${charName} / ${archiveName}」：\n\n1. 补齐当前聊天全部缺失或失效的逐楼摘要（${pendingCount} 楼）；\n2. 把尚未并入累计历史的 ${unmergedCount} 个AI回合做最后一次全量合并；\n3. 用“最终全量合并 + 人物关系/人物/物品/场景状态”覆盖此档案；\n4. 不把旧档逐楼摘要和旧分段锚点带入新开场。\n\n继续？`)) return false;
+
+  const contextToken = captureChatContextToken(data);
+  const operationEpoch = state.contextEpoch;
+  state.archiveRunning = true;
+  showStatus(`正在整理档案：${archiveName}`);
+  try {
+    if (pendingCount > 0) {
+      const repaired = await repairMissingGodlogs(Number.MAX_SAFE_INTEGER);
+      if (!repaired || !isSameChatContext(contextToken)) return false;
+    }
+
+    const fresh = memoryData();
+    const remaining = missingGodlogRepairRows(fresh);
+    if (remaining.length > 0) {
+      const floors = remaining.slice(0, 6).map(row => `第${row.index + 1}楼`).join('、');
+      throw new Error(`${floors}${remaining.length > 6 ? `等${remaining.length}楼` : ''}仍没有有效逐楼摘要；档案未被覆盖`);
+    }
+
+    if (mergeCycleMaterials(fresh).length > 0) {
+      const merged = await maybeMerge(true, false, normalizeMergeInterval(s.mergeInterval));
+      if (!merged || !isSameChatContext(contextToken)) throw new Error('最终全量合并没有完成；档案未被覆盖');
+    }
+
+    const finalData = memoryData();
+    if (!latestMerge(finalData)?.body) throw new Error('没有生成最终累计全量记忆；档案未被覆盖');
+    const sourceAiTurns = currentTransferCoverageCount(finalData);
+    s.slots[charName][archiveName] = {
+      ...archive,
+      updatedAt: Date.now(),
+      finalizedAt: Date.now(),
+      mode: 'full-merge',
+      sourceStorageId: String(finalData.processing?.storageId || archive.sourceStorageId || ''),
+      sourceAiTurns,
+      data: buildTransferArchiveSnapshot(finalData),
+    };
+    saveSettingsDebounced();
+    renderArchiveCards();
+    toastr?.success?.(`档案「${archiveName}」已完成最终全量整理：旧逐楼摘要与旧分段锚点不会带入新开场，新聊天可从第1楼重新计数。`, 'Anchor Memory', {
+      timeOut: 10000,
+      extendedTimeOut: 5000,
+      closeButton: true,
+      tapToDismiss: true,
+    });
+    return true;
+  } catch (err) {
+    toastr?.error?.(`归档整理失败：${err.message}`, 'Anchor Memory');
+    return false;
+  } finally {
+    if (state.contextEpoch === operationEpoch) state.archiveRunning = false;
+    if (isSameChatContext(contextToken)) {
+      showStatus(statusText(memoryData()));
+      if (state.jobSources.size > 0) queueMemoryJob('归档整理结束后续跑', 120);
+    }
+  }
+}
+
+function portableArchiveData(data, archive = null) {
+  const source = JSON.parse(JSON.stringify(data || defaultData()));
+  const finalMerge = latestMerge(source);
+  if (!finalMerge?.body) throw new Error('这个档案没有最终累计全量记忆');
+  const loaded = source;
+  loaded.godlogs = [];
+  loaded.anchors = [];
+  loaded.merges = [transferMergeSnapshot(finalMerge, archiveCoverageCount(archive || { data: source }))];
+  loaded.processing = {
+    ...defaultData().processing,
+    archiveImported: true,
+    archiveImportedAt: Date.now(),
+    archiveSourceAiTurns: archiveCoverageCount(archive || { data: source }),
+    storageId: '',
+    mergeCount: 1,
   };
   loaded.messageGodlogs = {};
   loaded.messageRecalls = {};
   loaded.vectorRefs = {};
   loaded.vectors = {};
-  loaded.processing.storageId = '';
   loaded.relationshipTable = normalizeRelationshipTable(loaded.relationshipTable, loaded.codex?.relationship || '');
   loaded.relationshipTable.history = [];
-  loaded.processing.godlogCount = loaded.godlogs.length;
+  loaded.relationshipTable.lastGoodFloor = -1;
+  loaded.relationshipTable.lastGoodKey = '';
+  loaded.codexBackup = null;
+  loaded.timeline = {
+    ...(loaded.timeline || defaultData().timeline),
+    currentSourceKey: '',
+    currentFloor: -1,
+    warnings: [],
+    history: [],
+    updatedAt: Date.now(),
+  };
   return loaded;
 }
 
@@ -9235,15 +9460,27 @@ async function loadArchive(archiveName = '') {
     toastr?.warning?.(`找不到 ${charName} 的这个记忆档案`, 'Anchor Memory');
     return;
   }
+  if (!archiveIsTransferReady(archive)) {
+    toastr?.warning?.('这个档案还没有完成“补齐摘要并全量合并”，为避免旧档第1楼与新档第1楼混淆，当前禁止直接加载。请先回原聊天完成全量整理。', 'Anchor Memory');
+    return;
+  }
+  if (!confirm(`加载档案「${charName} / ${archiveName}」会替换当前聊天内的 Anchor Memory 数据。将只带入最终累计全量记忆和人物、物品、场景状态，不带入旧逐楼摘要。继续？`)) return;
   const ctx = getContext();
   if (!ctx.chatMetadata) ctx.chatMetadata = {};
-  ctx.chatMetadata[DATA_KEY] = portableArchiveData(archive.data);
+  try {
+    ctx.chatMetadata[DATA_KEY] = portableArchiveData(archive.data, archive);
+  } catch (err) {
+    toastr?.error?.(`档案加载失败：${err.message}`, 'Anchor Memory');
+    return;
+  }
+  invalidateMemoryDataCache();
+  invalidateRuntimeCaches('archive loaded');
   const data = memoryData();
   saveMemory(true);
   await enforceAnchorHiddenState(data);
   await injectMemory();
   updatePreview();
-  toastr?.success?.(`已加载记忆档案：${charName} / ${archiveName}`, 'Anchor Memory');
+  toastr?.success?.(`已加载全量整理档案：${charName} / ${archiveName}。旧档楼层不会出现在逐楼摘要列表，新开场从第1楼独立计数。`, 'Anchor Memory');
 }
 
 function deleteArchive(archiveName = '') {
@@ -10095,6 +10332,7 @@ function bindUi() {
   $('#am_test_embedding').on('click', testEmbedding);
   $('#am_test_secondary').on('click', testSecondary);
   $('#am_save_archive').on('click', saveArchive);
+  $('#am_archive_cards').on('click', '.am-finalize-archive', function () { finalizeArchiveForTransfer($(this).data('archive')); });
   $('#am_archive_cards').on('click', '.am-load-archive', function () { loadArchive($(this).data('archive')); });
   $('#am_archive_cards').on('click', '.am-delete-archive', function () { deleteArchive($(this).data('archive')); });
   $('#am_save_tracked_characters').on('click', saveTrackedCharacterSettings);
@@ -10271,6 +10509,7 @@ function onChatChanged() {
   state.running = false;
   state.anchorPreparing = false;
   state.mergeRunning = false;
+  state.archiveRunning = false;
   state.summaryRunning = false;
   state.codexRunning = false;
   state.jobRunning = false;

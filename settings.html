@@ -226,11 +226,11 @@
 
       <section class="am-tab-panel" data-panel="archive">
         <div class="am-note">
-          记忆档案 = 跨聊天/跨开场白分支的手动快照。加载档案会带入累计锚点、人物纪要、人物库和物品记录；只有已配置并开启向量召回时，向量索引才参与检索。
+          记忆档案先保存普通快照，随后在档案卡片点击“补齐摘要并全量合并”。插件会补齐当前聊天的缺失逐楼摘要，把全部尚未并入累计历史的内容做最后一次全量合并，并生成可安全转档的整理版。整理版只带入最终累计全量记忆、人物关系、人物、物品和场景状态，不带入旧逐楼摘要与旧分段锚点，因此新开场可从第1楼独立计数。
         </div>
         <div class="am-actions">
           <input id="am_archive_name" class="text_pole" type="text" placeholder="档案名，如 主线 / IF旅馆 / 黑化分支" />
-          <button id="am_save_archive">保存当前为档案</button>
+          <button id="am_save_archive">保存当前快照</button>
         </div>
         <div id="am_archive_cards" class="am-card-list"></div>
       </section>
