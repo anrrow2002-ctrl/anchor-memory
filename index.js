@@ -143,7 +143,7 @@ function isGenerationActive() {
 
 
 const MODULE = 'anchor_memory';
-const EXTENSION_VERSION = '0.9.12';
+const EXTENSION_VERSION = '0.9.13';
 const DATA_KEY = 'anchorMemory';
 const CORE_PROMPT_KEY = 'anchor_memory_core';
 const RECALL_PROMPT_KEY = 'anchor_memory_recall';
@@ -2299,8 +2299,16 @@ function cleanupUserGodlogBlocks() {
 }
 
 function normalizeGodlogBlock(body) {
-  const text = String(body || '').trim();
-  if (!text) return '';
+  const raw = String(body || '').trim();
+  if (!raw) return '';
+  // Some OpenAI-compatible proxies return XML as escaped text. Decode only the structural entities
+  // used by Godlog so a valid response is not mistaken for an empty/short summary.
+  const text = raw
+    .replace(/&lt;/gi, '<')
+    .replace(/&gt;/gi, '>')
+    .replace(/&quot;/gi, '"')
+    .replace(/&#39;|&apos;/gi, "'")
+    .trim();
   const match = text.match(/<Godlog>[\s\S]*?<\/Godlog>/i);
   if (match) {
     const block = match[0].trim();
@@ -2311,6 +2319,61 @@ function normalizeGodlogBlock(body) {
   const converted = normalizeLegacyGodlogFields(text);
   if (converted) return converted;
   return `<Godlog>\n${text}\n</Godlog>`;
+}
+
+function compactCharacterCount(text) {
+  return Array.from(String(text || '').replace(/\s+/g, '')).length;
+}
+
+function expectedGodlogCondMin(row) {
+  const sourceChars = compactCharacterCount(row?.turnText || row?.text || '');
+  // Long role-play turns must honor the configured 200-character lower bound. Very short turns use
+  // a proportional floor so the validator never pressures the writer to invent details merely to pad.
+  if (sourceChars >= 400) return 200;
+  if (sourceChars >= 240) return 150;
+  return Math.max(60, Math.min(130, Math.floor(sourceChars * 0.62) || 60));
+}
+
+function validateGodlogCandidate(body, row) {
+  const block = normalizeGodlogBlock(body);
+  if (!block) return { ok: false, block: '', reason: '副API没有返回摘要正文', condChars: 0, minCondChars: expectedGodlogCondMin(row) };
+  const missing = GODLOG_FIELD_NAMES.filter(tag => !new RegExp(String.raw`<${tag}>[\s\S]*?<\/${tag}>`, 'i').test(block));
+  if (missing.length > 0) {
+    return {
+      ok: false,
+      block,
+      reason: `摘要XML缺少字段：${missing.join('、')}`,
+      condChars: compactCharacterCount(godlogFieldValue(block, 'Cond')),
+      minCondChars: expectedGodlogCondMin(row),
+    };
+  }
+  const cond = godlogFieldValue(block, 'Cond');
+  const condChars = compactCharacterCount(cond);
+  const minCondChars = expectedGodlogCondMin(row);
+  if (condChars < minCondChars) {
+    return {
+      ok: false,
+      block,
+      reason: `Cond仅${condChars}字，当前楼至少需要${minCondChars}字`,
+      condChars,
+      minCondChars,
+    };
+  }
+  return { ok: true, block, reason: '', condChars, minCondChars };
+}
+
+function buildGodlogCorrectionPrompt(basePrompt, failedBody, validation) {
+  return `${basePrompt}
+
+## 上一次输出不合格，必须从头重写
+问题：${validation?.reason || '格式或长度不合格'}。
+上一次输出：
+${clampText(String(failedBody || '（空）'), 1800)}
+
+请重新阅读“当前回合原文”，从头输出一个完整的 <Godlog> XML 块，不要续写上一次答案，不要解释。
+- 六个字段必须全部存在。
+- Cond 必须不少于 ${validation?.minCondChars || 200} 字；当前楼原文足够长时应保持 200—350 字。
+- 只能增加原文中已经发生的动作、转折、结果和关键原话，禁止用空话凑字数，禁止脑补。`;
 }
 
 function legacyGodlogFieldValue(text, field) {
@@ -3448,6 +3511,42 @@ function baseApiUrl(url) {
     .replace(/\/models\/?$/i, '');
 }
 
+function secondaryTextValue(value) {
+  if (typeof value === 'string') return value.trim();
+  if (Array.isArray(value)) {
+    return value.map(part => {
+      if (typeof part === 'string') return part;
+      if (typeof part?.text === 'string') return part.text;
+      if (typeof part?.content === 'string') return part.content;
+      return '';
+    }).filter(Boolean).join('').trim();
+  }
+  if (value && typeof value === 'object') {
+    if (typeof value.text === 'string') return value.text.trim();
+    if (typeof value.content === 'string') return value.content.trim();
+  }
+  return '';
+}
+
+function extractSecondaryResponseText(parsed) {
+  const directCandidates = [
+    parsed?.choices?.[0]?.message?.content,
+    parsed?.choices?.[0]?.text,
+    parsed?.content,
+    parsed?.output_text,
+    parsed?.response?.output_text,
+    parsed?.response?.content,
+  ];
+  for (const candidate of directCandidates) {
+    const text = secondaryTextValue(candidate);
+    if (text) return text;
+  }
+  const geminiParts = parsed?.candidates?.[0]?.content?.parts;
+  const geminiText = secondaryTextValue(geminiParts);
+  if (geminiText) return geminiText;
+  return '';
+}
+
 async function callSecondary(messages, maxTokens = 2400) {
   const s = settings();
   const base = baseApiUrl(s.secondaryUrl);
@@ -3500,7 +3599,7 @@ async function callSecondary(messages, maxTokens = 2400) {
       return { content: raw.trim(), finishReason: '' };
     }
     return {
-      content: (parsed.choices?.[0]?.message?.content || parsed.content || '').trim(),
+      content: extractSecondaryResponseText(parsed),
       finishReason: String(
         parsed.choices?.[0]?.finish_reason
         || parsed.finish_reason
@@ -6764,15 +6863,27 @@ async function generateGodlogForRow(row, force = false) {
   showStatus(`正在写逐楼摘要：第 ${row.index + 1} 楼`);
 
   try {
+    const basePrompt = buildGodlogPrompt(data, row, item);
     let body = '';
     if (item.pendingGeneratedBody && item.pendingGeneratedRawHash === sourceHash) {
       body = normalizeGodlogBlock(item.pendingGeneratedBody);
     } else {
-      body = normalizeGodlogBlock(await callSummaryWriter(buildGodlogPrompt(data, row, item), 1200));
+      body = normalizeGodlogBlock(await callSummaryWriter(basePrompt, 1200));
       if (!isSameChatContext(contextToken)) return false;
     }
     body = replaceGodlogField(body, 'Nub', String(item.number || godlogNumberForRow(row) || 1));
-    if (!body || body.trim().length < 30) throw new Error('摘要内容为空或过短');
+    let validation = validateGodlogCandidate(body, row);
+    if (!validation.ok) {
+      // A manual click used to resend the exact same prompt and therefore often reproduced the exact
+      // same short result. Perform one corrective regeneration immediately, with the measured defect.
+      const correctionPrompt = buildGodlogCorrectionPrompt(basePrompt, body, validation);
+      body = normalizeGodlogBlock(await callSummaryWriter(correctionPrompt, 1800));
+      if (!isSameChatContext(contextToken)) return false;
+      body = replaceGodlogField(body, 'Nub', String(item.number || godlogNumberForRow(row) || 1));
+      validation = validateGodlogCandidate(body, row);
+    }
+    if (!validation.ok) throw new Error(`摘要校验失败：${validation.reason}；已自动纠正重试1次`);
+    body = validation.block;
 
     // Never commit against a source revision different from the one sent to the writer. For a
     // manual rerun, keep the old ready snapshot untouched instead of demoting it to missing/stale.

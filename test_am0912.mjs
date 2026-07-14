@@ -6,8 +6,8 @@ const settingsHtml = fs.readFileSync(new URL('./settings.html', import.meta.url)
 const manifest = JSON.parse(fs.readFileSync(new URL('./manifest.json', import.meta.url), 'utf8'));
 const readme = fs.readFileSync(new URL('./README.md', import.meta.url), 'utf8');
 
-assert.equal(manifest.version, '0.9.12');
-assert.match(source, /const EXTENSION_VERSION = '0\.9\.12'/);
+assert.equal(manifest.version, '0.9.13');
+assert.match(source, /const EXTENSION_VERSION = '0\.9\.13'/);
 assert.match(source, /function archiveIsTransferReady/);
 assert.match(source, /function archiveMatchesCurrentChat/);
 assert.match(source, /function currentTransferCoverageCount/);

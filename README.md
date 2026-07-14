@@ -1,6 +1,14 @@
-# Anchor Memory 0.9.12 Archive Final Merge
+# Anchor Memory 0.9.13 Summary Length Repair
 
 面向长篇 SillyTavern 角色扮演的分层锚点记忆插件。
+
+
+## 0.9.13 摘要过短与重复重跑修复
+
+- 逐楼摘要不再只检查整个 XML 是否超过 30 个字符，而是验证六个字段完整，并单独检查 `Cond` 的实际字数。
+- 长楼层要求 `Cond` 至少 200 字；较短楼层按原文字数动态降低下限，避免为了凑字数而脑补。
+- 第一次输出过短、缺字段或为空时，插件会立即进行一次带明确错误原因的纠正重写，不再让玩家手动点击同一个提示词反复得到相同短结果。
+- 兼容副 API 返回的数组式 `content`、`output_text`、Gemini parts 以及转义 XML，避免有效摘要被错误读成空字符串。
 
 ## 0.9.12 归档转档全量整理
 
@@ -164,7 +172,7 @@
 
 ## 安装
 
-为避免 SillyTavern 把它识别为第二个扩展，本安装包故意保留原目录名 `anchor-memory-0.9.11-REWRITE-CONTROLS`。请直接覆盖现有同名目录，不要与旧版并存；插件清单版本已经升级为 0.9.12。升级前可在“工具”页导出当前记忆 JSON；本次不改变聊天数据结构，已有 Godlog、锚点、合并、关系表和索引会保留。
+为避免 SillyTavern 把它识别为第二个扩展，本安装包故意保留原目录名 `anchor-memory-0.9.11-REWRITE-CONTROLS`。请直接覆盖现有同名目录，不要与旧版并存；插件清单版本已经升级为 0.9.13。升级前可在“工具”页导出当前记忆 JSON；本次不改变聊天数据结构，已有 Godlog、锚点、合并、关系表和索引会保留。
 
 ## 自检
 
@@ -175,4 +183,4 @@ node --check index.js
 node test_am0912.mjs
 ```
 
-详细结果见 `TEST-REPORT-0.9.12.md`。
+归档流程测试见 `TEST-REPORT-0.9.12.md`；摘要长度修复测试见 `TEST-REPORT-0.9.13.md`。
