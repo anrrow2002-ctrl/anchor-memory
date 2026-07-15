@@ -21,8 +21,8 @@ const manifest = JSON.parse(fs.readFileSync(new URL('./manifest.json', import.me
 const html = fs.readFileSync(new URL('./settings.html', import.meta.url), 'utf8');
 const css = fs.readFileSync(new URL('./style.css', import.meta.url), 'utf8');
 
-assert.equal(manifest.version, '0.9.8');
-assert.match(source, /const EXTENSION_VERSION = '0\.9\.8'/);
+assert.equal(manifest.version, '0.9.14');
+assert.match(source, /const EXTENSION_VERSION = '0\.9\.14'/);
 assert.match(source, /const DATA_VERSION = 11/);
 assert.match(source, /const SOURCE_HASH_SCHEMA_VERSION = 4/);
 

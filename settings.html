@@ -297,8 +297,11 @@
             <datalist id="am_secondary_model_options"></datalist>
           </label>
           <div class="am-actions">
-            <button id="am_fetch_secondary_models">拉取副API模型</button>
-            <button id="am_test_secondary">测试副API</button>
+            <button id="am_fetch_secondary_models" type="button">拉取副API模型</button>
+            <button id="am_test_secondary" type="button">测试副API</button>
+          </div>
+          <div class="am-note">
+            每次点击“拉取副API模型”都会先清空旧模型栏，再读取当前手机输入框中的地址与密钥；插件优先通过酒馆后端代理拉取，失败后才尝试浏览器直连。拉取失败时模型栏保持为空，不会继续误用旧模型。
           </div>
         </div>
 
@@ -313,8 +316,8 @@
         </label>
         <div id="am_embedding_fields" class="am-panel am-panel-visible">
           <div class="am-actions">
-            <button id="am_apply_siliconflow_embedding">硅基流动向量配置</button>
-            <button id="am_fetch_embedding_models">拉取向量模型</button>
+            <button id="am_apply_siliconflow_embedding" type="button">硅基流动向量配置</button>
+            <button id="am_fetch_embedding_models" type="button">拉取向量模型</button>
           </div>
           <label>向量API地址（留空则复用副API地址）
             <input id="am_embedding_url" class="text_pole" type="text" placeholder="https://api.siliconflow.cn/v1" />

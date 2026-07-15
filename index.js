@@ -143,7 +143,7 @@ function isGenerationActive() {
 
 
 const MODULE = 'anchor_memory';
-const EXTENSION_VERSION = '0.9.13';
+const EXTENSION_VERSION = '0.9.14';
 const DATA_KEY = 'anchorMemory';
 const CORE_PROMPT_KEY = 'anchor_memory_core';
 const RECALL_PROMPT_KEY = 'anchor_memory_recall';
@@ -2532,9 +2532,17 @@ function memoryHideMeta(message) {
 function isMemoryManagedHidden(message) {
   const meta = memoryHideMeta(message);
   return !!(
-    meta?.hiddenByMemory
+    meta?.hiddenByMemory === true
     || (Array.isArray(meta?.hiddenAnchorIds) && meta.hiddenAnchorIds.length > 0)
   );
+}
+
+function hasMemoryHideOwnership(message) {
+  const meta = memoryHideMeta(message);
+  if (!meta) return false;
+  return isMemoryManagedHidden(message)
+    || Object.prototype.hasOwnProperty.call(meta, 'wasHiddenBeforeAnchor')
+    || Object.prototype.hasOwnProperty.call(meta, 'wasSystemBeforeAnchor');
 }
 
 function isNarrativeMessage(message) {
@@ -2724,7 +2732,7 @@ function isGodlogMissingOrStale(data, row) {
   if (!item) return true;
   if (item.status === 'failed') {
     const s = settings();
-    return !!(s.useSecondary && s.secondaryUrl && s.secondaryKey && (item.retryCount || 0) < 3);
+    return !!(secondaryConfigured(s) && (item.retryCount || 0) < 3);
   }
   if (item.status === 'orphaned') return false;
   return !isGodlogReady(item, row);
@@ -2850,7 +2858,7 @@ function pendingGodlogRows(data) {
 }
 
 function hasPendingMemoryWork() {
-  if (!hasPersistentChatContext()) return false;
+  if (!hasPersistentChatContext() || !secondaryConfigured()) return false;
   const data = memoryData();
   const anchorInterval = normalizeAnchorInterval(settings().anchorInterval);
   const mergeInterval = normalizeMergeInterval(settings().mergeInterval);
@@ -2864,7 +2872,7 @@ function hasPendingMemoryWork() {
 
 function pendingCodexRows(data) {
   if (data.processing?.codexDirty) return [];
-  if (!settings().useSecondary || !settings().secondaryUrl || !settings().secondaryKey) return [];
+  if (!secondaryConfigured()) return [];
   const codexKeys = data.processing?.codexKeys || {};
   return chatRows(true)
     .filter(row => row.role === 'assistant')
@@ -2902,7 +2910,7 @@ function newerAssistantCountForRow(row) {
 function missingGodlogUiStatus(row, data = memoryData()) {
   const item = row ? godlogForRow(data, row) : null;
   if (item?.status) return item.status;
-  const hasSecondary = !!(settings().useSecondary && settings().secondaryUrl && settings().secondaryKey);
+  const hasSecondary = secondaryConfigured();
   if (!hasSecondary) return 'missing';
   return newerAssistantCountForRow(row) >= MISSING_GODLOG_WARNING_MIN_NEWER ? 'missing' : 'pending';
 }
@@ -2910,7 +2918,7 @@ function missingGodlogUiStatus(row, data = memoryData()) {
 function missingGodlogUiText(row, data = memoryData()) {
   const status = missingGodlogUiStatus(row, data);
   if (status === 'pending') return '正文已完成，逐楼摘要正在后台生成或排队。';
-  if (!settings().useSecondary || !settings().secondaryUrl || !settings().secondaryKey) return '尚未生成逐楼摘要；配置副API后可自动补写。';
+  if (!secondaryConfigured()) return '尚未生成逐楼摘要；配置副API后可自动补写。';
   return '这楼已经落后仍无有效摘要；点“自动补写缺失摘要”会调用模型补写。';
 }
 
@@ -2973,7 +2981,7 @@ function maybeWarnMissingGodlogs(data = memoryData()) {
 
   const floors = issues.slice(0, 4).map(({ row }) => `第 ${row.index + 1} 楼`).join('、');
   const suffix = issues.length > 4 ? `等 ${issues.length} 楼` : '';
-  const canRetry = !!(settings().useSecondary && settings().secondaryUrl && settings().secondaryKey);
+  const canRetry = secondaryConfigured();
   const retryText = canRetry
     ? '插件会继续自动重试；也可在锚点书的“逐楼摘要”页点击“自动补写缺失摘要”立即重跑。'
     : '请先在锚点书中补全副API，再到“逐楼摘要”页点击“自动补写缺失摘要”。';
@@ -3507,49 +3515,159 @@ function baseApiUrl(url) {
     .trim()
     .replace(/\/+$/, '')
     .replace(/\/chat\/completions\/?$/i, '')
+    .replace(/\/responses\/?$/i, '')
     .replace(/\/embeddings\/?$/i, '')
     .replace(/\/models\/?$/i, '');
 }
 
-function secondaryTextValue(value) {
+function secondaryConfigured(value = settings()) {
+  const s = value || {};
+  return !!(
+    s.useSecondary
+    && baseApiUrl(s.secondaryUrl)
+    && String(s.secondaryKey || '').trim()
+    && String(s.secondaryModel || '').trim()
+  );
+}
+
+function secondaryTextValue(value, depth = 0) {
+  if (depth > 6 || value == null) return '';
   if (typeof value === 'string') return value.trim();
+  if (typeof value === 'number' || typeof value === 'boolean') return '';
   if (Array.isArray(value)) {
-    return value.map(part => {
-      if (typeof part === 'string') return part;
-      if (typeof part?.text === 'string') return part.text;
-      if (typeof part?.content === 'string') return part.content;
-      return '';
-    }).filter(Boolean).join('').trim();
+    return value
+      .map(part => secondaryTextValue(part, depth + 1))
+      .filter(Boolean)
+      .join('')
+      .trim();
   }
-  if (value && typeof value === 'object') {
-    if (typeof value.text === 'string') return value.text.trim();
-    if (typeof value.content === 'string') return value.content.trim();
+  if (typeof value === 'object') {
+    // Prefer fields that are known to carry model-visible output. Do not stringify the whole object,
+    // otherwise error metadata may be mistaken for a valid summary.
+    for (const key of ['text', 'content', 'output_text', 'generated_text', 'completion', 'result', 'answer', 'reply', 'value']) {
+      const text = secondaryTextValue(value[key], depth + 1);
+      if (text) return text;
+    }
   }
   return '';
 }
 
+function extractSecondaryError(parsed) {
+  const error = parsed?.error || parsed?.response?.error || parsed?.data?.error;
+  if (typeof error === 'string' && error.trim()) return error.trim();
+  if (error && typeof error === 'object') {
+    return String(error.message || error.detail || error.type || error.code || '').trim();
+  }
+  const status = String(parsed?.status || parsed?.response?.status || '').toLowerCase();
+  if (['error', 'failed', 'failure'].includes(status)) {
+    return String(parsed?.message || parsed?.detail || parsed?.response?.message || '副API返回失败状态').trim();
+  }
+  return '';
+}
+
+function extractSecondaryFinishReason(parsed) {
+  return String(
+    parsed?.choices?.[0]?.finish_reason
+    || parsed?.data?.choices?.[0]?.finish_reason
+    || parsed?.response?.choices?.[0]?.finish_reason
+    || parsed?.finish_reason
+    || parsed?.stop_reason
+    || parsed?.candidates?.[0]?.finishReason
+    || '',
+  ).toLowerCase();
+}
+
 function extractSecondaryResponseText(parsed) {
-  const directCandidates = [
-    parsed?.choices?.[0]?.message?.content,
-    parsed?.choices?.[0]?.text,
-    parsed?.content,
-    parsed?.output_text,
-    parsed?.response?.output_text,
-    parsed?.response?.content,
-  ];
+  const roots = [parsed, parsed?.data, parsed?.response].filter(Boolean);
+  const directCandidates = [];
+  for (const root of roots) {
+    directCandidates.push(
+      root?.choices?.[0]?.message?.content,
+      root?.choices?.[0]?.delta?.content,
+      root?.choices?.[0]?.text,
+      root?.message?.content,
+      root?.message?.text,
+      root?.message,
+      root?.content,
+      root?.output_text,
+      root?.text,
+      root?.generated_text,
+      root?.result,
+      root?.completion,
+      root?.answer,
+      root?.reply,
+      typeof root === 'string' ? root : '',
+    );
+    // Responses API shape: output[].content[].text / output_text.
+    for (const output of root?.output || []) {
+      directCandidates.push(output?.content, output?.text, output?.output_text);
+    }
+  }
   for (const candidate of directCandidates) {
     const text = secondaryTextValue(candidate);
     if (text) return text;
   }
-  const geminiParts = parsed?.candidates?.[0]?.content?.parts;
+
+  if (Array.isArray(parsed)) {
+    const arrayText = secondaryTextValue(parsed);
+    if (arrayText) return arrayText;
+  }
+
+  const geminiParts = parsed?.candidates?.[0]?.content?.parts
+    || parsed?.data?.candidates?.[0]?.content?.parts
+    || parsed?.response?.candidates?.[0]?.content?.parts;
   const geminiText = secondaryTextValue(geminiParts);
   if (geminiText) return geminiText;
+
+  // Some reasoning models/proxies put the entire answer in a reasoning field and leave content null.
+  // Use this only as a last-resort compatibility fallback, after all normal answer fields are empty.
+  for (const root of roots) {
+    for (const candidate of [
+      root?.choices?.[0]?.message?.reasoning_content,
+      root?.choices?.[0]?.message?.reasoning,
+      root?.choices?.[0]?.message?.analysis,
+      root?.reasoning_content,
+    ]) {
+      const text = secondaryTextValue(candidate);
+      if (text) return text;
+    }
+  }
   return '';
+}
+
+function parseSecondarySse(raw) {
+  const chunks = [];
+  let finishReason = '';
+  for (const line of String(raw || '').split(/\r?\n/)) {
+    const trimmed = line.trim();
+    if (!trimmed.startsWith('data:')) continue;
+    const payload = trimmed.slice(5).trim();
+    if (!payload || payload === '[DONE]') continue;
+    try {
+      const parsed = JSON.parse(payload);
+      const error = extractSecondaryError(parsed);
+      if (error) throw new Error(error);
+      const text = extractSecondaryResponseText(parsed);
+      if (text) chunks.push(text);
+      finishReason ||= extractSecondaryFinishReason(parsed);
+    } catch (err) {
+      if (err instanceof SyntaxError) continue;
+      throw err;
+    }
+  }
+  return { content: chunks.join('').trim(), finishReason };
+}
+
+function secondaryResponseShape(parsed) {
+  if (!parsed || typeof parsed !== 'object') return typeof parsed;
+  return Object.keys(parsed).slice(0, 10).join(',') || 'empty-object';
 }
 
 async function callSecondary(messages, maxTokens = 2400) {
   const s = settings();
   const base = baseApiUrl(s.secondaryUrl);
+  if (!base || !s.secondaryKey) throw new Error('副API地址或密钥未配置');
+  if (!String(s.secondaryModel || '').trim()) throw new Error('副API模型为空；请先拉取模型或手动填写准确模型名');
 
   const requestOnce = async (requestMessages, tokenBudget) => {
     const request = state.requests.create('secondary');
@@ -3581,7 +3699,7 @@ async function callSecondary(messages, maxTokens = 2400) {
         if (timedOut) throw new Error('副API请求超过120秒，已自动中止并释放摘要队列');
         throw new Error('副API请求已因切换聊天、刷新页面或取消任务而中止；结果不会写入任何聊天');
       }
-      throw err;
+      throw new Error(`副API请求失败：${err?.message || String(err)}`);
     } finally {
       clearTimeout(timeout);
       request.cleanup();
@@ -3592,21 +3710,34 @@ async function callSecondary(messages, maxTokens = 2400) {
       throw new Error(`Secondary API ${response.status}: ${errText.slice(0, 180)}`);
     }
     const raw = await response.text();
+    if (!String(raw || '').trim()) throw new Error('副API返回了空响应体；请先点“测试副API”检查模型、地址和密钥');
     let parsed;
     try {
       parsed = JSON.parse(raw);
     } catch {
-      return { content: raw.trim(), finishReason: '' };
+      const sse = parseSecondarySse(raw);
+      if (sse.content) return sse;
+      // A plain-text provider response is valid only when it contains actual text, not an HTML error page.
+      const plain = raw.trim();
+      if (/^\s*<!doctype html|^\s*<html/i.test(plain)) {
+        throw new Error(`副API返回了HTML页面而不是模型结果：${plain.replace(/\s+/g, ' ').slice(0, 140)}`);
+      }
+      return { content: plain, finishReason: '' };
     }
-    return {
-      content: extractSecondaryResponseText(parsed),
-      finishReason: String(
-        parsed.choices?.[0]?.finish_reason
-        || parsed.finish_reason
-        || parsed.stop_reason
-        || '',
-      ).toLowerCase(),
-    };
+    const apiError = extractSecondaryError(parsed);
+    if (apiError) throw new Error(`副API返回错误：${apiError}`);
+    const content = extractSecondaryResponseText(parsed);
+    const finishReason = extractSecondaryFinishReason(parsed);
+    if (!content) {
+      const refusal = secondaryTextValue(
+        parsed?.choices?.[0]?.message?.refusal
+        || parsed?.data?.choices?.[0]?.message?.refusal
+        || parsed?.response?.choices?.[0]?.message?.refusal,
+      );
+      const detail = refusal ? `；模型拒绝：${refusal.slice(0, 140)}` : '';
+      throw new Error(`副API响应成功但没有可用正文（finish_reason=${finishReason || '未提供'}，顶层字段=${secondaryResponseShape(parsed)}${detail}）`);
+    }
+    return { content, finishReason };
   };
 
   const truncatedReasons = new Set(['length', 'max_tokens', 'max_output_tokens', 'token_limit']);
@@ -3632,7 +3763,7 @@ The previous attempt was cut off by the output-token limit. Regenerate the compl
 
 async function callWriter(prompt, maxTokens = 3200) {
   const s = settings();
-  if (s.useSecondary && s.secondaryUrl && s.secondaryKey) {
+  if (secondaryConfigured(s)) {
     return callSecondary([
       { role: 'system', content: 'You are a precise narrative memory archivist. Output only the requested Markdown.' },
       { role: 'user', content: prompt },
@@ -3643,7 +3774,7 @@ async function callWriter(prompt, maxTokens = 3200) {
 
 async function callSummaryWriter(prompt, maxTokens = 1000) {
   const s = settings();
-  if (!s.useSecondary || !s.secondaryUrl || !s.secondaryKey) {
+  if (!secondaryConfigured(s)) {
     throw new Error('逐楼摘要需要先配置并启用副API');
   }
   return callSecondary([
@@ -3791,7 +3922,7 @@ ${currentFacts || cleanText(row.turnText || row.text)}`;
 async function updateCodexFromGodlog(data, row, godlog, force = false) {
   if (!data || !row || !godlog || godlog.status !== 'ready' || !godlog.body) return false;
   const s = settings();
-  if (!s.useSecondary || !s.secondaryUrl || !s.secondaryKey) return false;
+  if (!secondaryConfigured(s)) return false;
   if (data.processing?.codexDirty && !force) {
     scheduleCodexBacklog();
     return false;
@@ -3916,7 +4047,7 @@ async function processCodexBacklog(limit = 4) {
 
 async function rebuildCodexFromGodlogs(confirmFirst = true) {
   const s = settings();
-  if (!s.useSecondary || !s.secondaryUrl || !s.secondaryKey) {
+  if (!secondaryConfigured(s)) {
     if (confirmFirst) toastr?.warning?.('请先配置并启用副API，人物索引重建需要后台模型。', 'Anchor Memory');
     return false;
   }
@@ -4009,7 +4140,7 @@ async function rebuildCodexFromGodlogs(confirmFirst = true) {
 
 async function rebuildRelationshipFromGodlogs(confirmFirst = true) {
   const s = settings();
-  if (!s.useSecondary || !s.secondaryUrl || !s.secondaryKey) {
+  if (!secondaryConfigured(s)) {
     if (confirmFirst) toastr?.warning?.('请先配置并启用副API，人物关系表需要后台模型填写。', 'Anchor Memory');
     return false;
   }
@@ -4087,7 +4218,7 @@ async function rebuildRelationshipFromGodlogs(confirmFirst = true) {
 }
 
 function scheduleCodexBacklog(limit = 4) {
-  if (!settings().useSecondary || !settings().secondaryUrl || !settings().secondaryKey) return;
+  if (!secondaryConfigured()) return;
   if (state.codexTimer) clearTimeout(state.codexTimer);
   state.codexTimer = setTimeout(() => {
     state.codexTimer = null;
@@ -5042,42 +5173,221 @@ function looksLikeChatModel(id) {
   return !looksLikeEmbeddingModel(id) && !/(rerank|stable-diffusion|image|video|tts|whisper)/i.test(String(id || ''));
 }
 
-async function fetchProviderModels(url, key, subType = '') {
-  const base = baseApiUrl(url);
-  if (!base || !key) throw new Error('请先填写 API 地址和密钥');
+function collectModelIds(payload) {
+  const ids = [];
+  const seen = new Set();
+  const add = value => {
+    const id = String(value || '').trim();
+    if (!id || id.length >= 300) return;
+    ids.push(id);
+  };
+  const readModelEntry = entry => {
+    if (typeof entry === 'string') return add(entry);
+    if (!entry || typeof entry !== 'object') return;
+    // `id` and `model` are strong model identifiers. `name` is accepted only inside an
+    // actual model-list container, never from arbitrary provider/account metadata.
+    add(entry.id || entry.model || entry.name);
+  };
+  const visitContainer = (value, depth = 0) => {
+    if (depth > 7 || value == null) return;
+    if (typeof value === 'string') return add(value);
+    if (typeof value !== 'object' || seen.has(value)) return;
+    seen.add(value);
+    if (Array.isArray(value)) {
+      for (const entry of value) {
+        readModelEntry(entry);
+        if (entry && typeof entry === 'object') {
+          for (const key of ['data', 'models', 'items', 'result', 'response', 'available_models', 'model_list', 'model_names', 'model_ids']) {
+            if (entry[key] != null) visitContainer(entry[key], depth + 1);
+          }
+        }
+      }
+      return;
+    }
+    // A root/item with an explicit id/model is itself a model record. Do not accept a lone `name`
+    // here because status endpoints often use it for the provider or account display name.
+    add(value.id || value.model);
+    for (const key of ['data', 'models', 'items', 'result', 'response', 'available_models', 'model_list', 'model_names', 'model_ids']) {
+      if (value[key] != null) visitContainer(value[key], depth + 1);
+    }
+  };
+  visitContainer(payload);
+  return [...new Set(ids)];
+}
+
+async function fetchModelsThroughSillyTavern(base, key) {
+  // SillyTavern versions differ on whether a custom OpenAI-compatible endpoint is represented as
+  // `custom_url/api_key` or `reverse_proxy/proxy_password`. Try both contracts through the server
+  // so mobile browsers do not depend on cross-origin /models access.
+  const attempts = [
+    {
+      endpoint: '/api/backends/chat-completions/status',
+      label: 'status/custom',
+      body: {
+        chat_completion_source: 'custom',
+        custom_url: base,
+        custom_model: '',
+        api_key: key,
+      },
+    },
+    {
+      endpoint: '/api/backends/chat-completions/status',
+      label: 'status/reverse-proxy',
+      body: {
+        chat_completion_source: 'openai',
+        reverse_proxy: base,
+        proxy_password: key,
+      },
+    },
+    {
+      endpoint: '/api/backends/chat-completions/models',
+      label: 'models/custom',
+      body: {
+        chat_completion_source: 'custom',
+        custom_url: base,
+        custom_model: '',
+        api_key: key,
+      },
+    },
+    {
+      endpoint: '/api/backends/chat-completions/models',
+      label: 'models/reverse-proxy',
+      body: {
+        chat_completion_source: 'openai',
+        reverse_proxy: base,
+        proxy_password: key,
+      },
+    },
+  ];
+  let lastError = '';
+  const deadline = Date.now() + 24000;
+  for (const attempt of attempts) {
+    const remainingMs = deadline - Date.now();
+    if (remainingMs <= 0) break;
+    const request = state.requests.create('models');
+    let timedOut = false;
+    const attemptTimeoutMs = Math.max(1200, Math.min(8000, remainingMs));
+    const timeout = setTimeout(() => {
+      timedOut = true;
+      try { request.controller.abort('model-list-timeout'); } catch { request.controller.abort(); }
+    }, attemptTimeoutMs);
+    try {
+      const response = await fetch(attempt.endpoint, {
+        method: 'POST',
+        signal: request.controller.signal,
+        headers: getRequestHeaders(),
+        body: JSON.stringify(attempt.body),
+      });
+      if (!response.ok) {
+        const text = await response.text().catch(() => '');
+        lastError = `${attempt.label} ${response.status}: ${text.slice(0, 140)}`;
+        continue;
+      }
+      const raw = await response.text();
+      let parsed;
+      try { parsed = JSON.parse(raw); } catch {
+        lastError = `${attempt.label} 返回了非JSON模型列表`;
+        continue;
+      }
+      const apiError = extractSecondaryError(parsed);
+      if (apiError) {
+        lastError = `${attempt.label}: ${apiError}`;
+        continue;
+      }
+      const models = collectModelIds(parsed);
+      if (models.length > 0) return models;
+      lastError = `${attempt.label} 未返回模型ID`;
+    } catch (err) {
+      lastError = timedOut ? `${attempt.label} 请求超过${Math.ceil(attemptTimeoutMs / 1000)}秒` : (err?.message || String(err));
+    } finally {
+      clearTimeout(timeout);
+      request.cleanup();
+    }
+  }
+  throw new Error(lastError || '酒馆后端代理未返回模型列表');
+}
+
+async function fetchModelsDirect(base, key, subType = '') {
   const urls = [];
   if (subType) urls.push({ endpoint: `${base}/models?sub_type=${encodeURIComponent(subType)}`, filteredByProvider: true });
   urls.push({ endpoint: `${base}/models`, filteredByProvider: false });
-
   let lastError = '';
+  const deadline = Date.now() + 16000;
   for (const { endpoint, filteredByProvider } of urls) {
+    const remainingMs = deadline - Date.now();
+    if (remainingMs <= 0) break;
+    const request = state.requests.create('models');
+    let timedOut = false;
+    const attemptTimeoutMs = Math.max(1200, Math.min(9000, remainingMs));
+    const timeout = setTimeout(() => {
+      timedOut = true;
+      try { request.controller.abort('model-list-timeout'); } catch { request.controller.abort(); }
+    }, attemptTimeoutMs);
     try {
-      const request = state.requests.create('models');
       const response = await fetch(endpoint, {
         method: 'GET',
         signal: request.controller.signal,
-        headers: { Authorization: `Bearer ${key}` },
-      }).finally(request.cleanup);
+        headers: {
+          Accept: 'application/json',
+          Authorization: `Bearer ${key}`,
+        },
+      });
       if (!response.ok) {
         const text = await response.text().catch(() => '');
         lastError = `${response.status}: ${text.slice(0, 160)}`;
         continue;
       }
-      const json = await response.json();
-      const ids = (json.data || [])
-        .map(item => item.id || item.name || item.model)
-        .filter(Boolean)
-        .map(String);
+      const raw = await response.text();
+      let json;
+      try { json = JSON.parse(raw); } catch {
+        lastError = '模型接口返回了非JSON内容';
+        continue;
+      }
+      const apiError = extractSecondaryError(json);
+      if (apiError) {
+        lastError = apiError;
+        continue;
+      }
+      const ids = collectModelIds(json);
       if (filteredByProvider && ids.length > 0) return ids;
       if (filteredByProvider) continue;
-      if (subType === 'embedding') return ids.filter(looksLikeEmbeddingModel);
-      if (subType === 'chat') return ids.filter(looksLikeChatModel);
       return ids;
     } catch (err) {
-      lastError = err.message;
+      lastError = timedOut ? `${endpoint} 请求超过${Math.ceil(attemptTimeoutMs / 1000)}秒` : (err?.message || String(err));
+    } finally {
+      clearTimeout(timeout);
+      request.cleanup();
     }
   }
   throw new Error(lastError || '模型列表为空或接口不支持拉取');
+}
+
+async function fetchProviderModels(url, key, subType = '') {
+  const base = baseApiUrl(url);
+  if (!base || !key) throw new Error('请先填写 API 地址和密钥');
+  let ids = [];
+  let proxyError = '';
+  try {
+    // Mobile browsers frequently block direct cross-origin /models calls. Prefer the same
+    // SillyTavern server-side proxy path used by actual summary generation.
+    ids = await fetchModelsThroughSillyTavern(base, key);
+  } catch (err) {
+    proxyError = err?.message || String(err);
+    try {
+      ids = await fetchModelsDirect(base, key, subType);
+    } catch (directErr) {
+      throw new Error(`酒馆代理拉取失败：${proxyError}；浏览器直连也失败：${directErr?.message || directErr}`);
+    }
+  }
+  const filtered = subType === 'embedding'
+    ? ids.filter(looksLikeEmbeddingModel)
+    : subType === 'chat'
+      ? ids.filter(looksLikeChatModel)
+      : ids;
+  if (filtered.length === 0) {
+    throw new Error(subType === 'embedding' ? '接口返回了模型，但没有识别到Embedding模型' : '接口返回了模型，但没有识别到可用对话模型');
+  }
+  return [...new Set(filtered)].sort((a, b) => a.localeCompare(b));
 }
 
 function renderModelOptions(selector, models) {
@@ -6437,7 +6747,7 @@ function removeGodlogBlockFromMessage(row) {
   if (!row) return false;
   const chat = getContext().chat || [];
   const message = chat[row.index];
-  if (!message || message.is_system || !stripGodlogFromMessageRecord(message)) return false;
+  if (!message || (message.is_system && !isMemoryManagedHidden(message)) || !stripGodlogFromMessageRecord(message)) return false;
 
   refreshMessageBlock(row);
   saveChatNow();
@@ -6449,7 +6759,7 @@ function removeAllGodlogBlocksFromChat() {
   let changed = false;
   for (let index = 0; index < chat.length; index++) {
     const message = chat[index];
-    if (!message || message.is_system) continue;
+    if (!message || (message.is_system && !isMemoryManagedHidden(message))) continue;
     const rowChanged = stripGodlogFromMessageRecord(message);
     if (rowChanged) refreshMessageBlock(index);
     changed = rowChanged || changed;
@@ -6499,7 +6809,7 @@ async function setMessagesHiddenByAnchor(indices, hidden, anchorId = '') {
     // Never take ownership of a genuine SillyTavern system/hidden message. We only unhide records
     // carrying our own metadata, including records hidden by older Anchor Memory versions.
     if (hidden && message.is_system && !isMemoryManagedHidden(message)) continue;
-    if (!hidden && !isMemoryManagedHidden(message) && !message.is_hidden) continue;
+    if (!hidden && !hasMemoryHideOwnership(message)) continue;
 
     const meta = anchorHiddenMeta(message);
     if (hidden) {
@@ -6554,9 +6864,10 @@ async function setMessagesHiddenByAnchor(indices, hidden, anchorId = '') {
       meta.hiddenByMemory = true;
       message.is_hidden = true;
     } else {
-      meta.hiddenByMemory = false;
       message.is_hidden = meta.wasHiddenBeforeAnchor === true;
       message.is_system = meta.wasSystemBeforeAnchor === true;
+      delete meta.hiddenByMemory;
+      delete meta.hiddenAnchorIds;
       delete meta.wasHiddenBeforeAnchor;
       delete meta.wasSystemBeforeAnchor;
     }
@@ -6714,7 +7025,7 @@ async function enforceAnchorHiddenState(data = memoryData()) {
     for (let index = 0; index < chat.length; index++) {
       const message = chat[index];
       if (!message) continue;
-      const managed = isMemoryManagedHidden(message) || (!!message.is_hidden && !!memoryHideMeta(message));
+      const managed = hasMemoryHideOwnership(message);
       if (desiredHidden.has(index)) {
         if (!managed || !message.is_hidden) toHide.push(index);
       } else if (managed) {
@@ -6825,7 +7136,7 @@ async function generateGodlogForRow(row, force = false) {
   }
   if (!force && existing?.status === 'failed') {
     const s = settings();
-    const canRetry = !!(s.useSecondary && s.secondaryUrl && s.secondaryKey && (existing.retryCount || 0) < 3);
+    const canRetry = !!(secondaryConfigured(s) && (existing.retryCount || 0) < 3);
     if (!canRetry) return false;
   }
 
@@ -6874,8 +7185,10 @@ async function generateGodlogForRow(row, force = false) {
     body = replaceGodlogField(body, 'Nub', String(item.number || godlogNumberForRow(row) || 1));
     let validation = validateGodlogCandidate(body, row);
     if (!validation.ok) {
-      // A manual click used to resend the exact same prompt and therefore often reproduced the exact
-      // same short result. Perform one corrective regeneration immediately, with the measured defect.
+      // Only a real model answer with a format/length defect gets a corrective rewrite. Transport,
+      // authentication, empty-response and parser errors are thrown by callSecondary with the real
+      // cause and must not be disguised as a second “summary correction” request.
+      if (!String(body || '').trim()) throw new Error(`摘要校验失败：${validation.reason}`);
       const correctionPrompt = buildGodlogCorrectionPrompt(basePrompt, body, validation);
       body = normalizeGodlogBlock(await callSummaryWriter(correctionPrompt, 1800));
       if (!isSameChatContext(contextToken)) return false;
@@ -7034,7 +7347,7 @@ async function processGodlogBacklog(limit = 4) {
       const ok = await generateGodlogForRow(row, false);
       if (!isSameChatContext(contextToken)) return false;
       if (ok) okCount++;
-      if (!ok && (!settings().useSecondary || !settings().secondaryUrl || !settings().secondaryKey)) break;
+      if (!ok && (!secondaryConfigured())) break;
     }
     return okCount === rows.length;
   } finally {
@@ -7073,7 +7386,7 @@ async function repairMissingGodlogs(limit = Number.MAX_SAFE_INTEGER) {
       const ok = await generateGodlogForRow(row, true);
       if (!isSameChatContext(contextToken)) return false;
       if (ok) okCount++;
-      if (!ok && (!settings().useSecondary || !settings().secondaryUrl || !settings().secondaryKey)) break;
+      if (!ok && (!secondaryConfigured())) break;
     }
     if (okCount === rows.length) {
       toastr?.success?.(`已自动补写 ${okCount} 楼逐楼摘要`, 'Anchor Memory');
@@ -8941,7 +9254,7 @@ function renderArchiveCards() {
         <div class="am-card-body">${escapeHtml(counts)}</div>
         <div class="am-card-actions">
           <button class="am-finalize-archive" data-archive="${escapeHtml(name)}" title="${escapeHtml(finalizeTitle)}" ${sameSource ? '' : 'disabled'}>${escapeHtml(finalizeLabel)}</button>
-          <button class="am-load-archive" data-archive="${escapeHtml(name)}" ${ready ? '' : 'disabled'} title="${ready ? '仅加载最终累计全量记忆与人物、物品、场景状态' : '请先完成全量整理'}">${ready ? '加载到当前聊天' : '需先全量整理'}</button>
+          <button class="am-load-archive" data-archive="${escapeHtml(name)}" ${(ready && !sameSource) ? '' : 'disabled'} title="${sameSource ? '这是档案的原聊天；禁止把精简转档副本覆盖回原聊天' : (ready ? '仅加载最终累计全量记忆与人物、物品、场景状态' : '请先完成全量整理')}">${sameSource ? '原聊天禁止加载' : (ready ? '加载到当前聊天' : '需先全量整理')}</button>
           <button class="am-delete-archive" data-archive="${escapeHtml(name)}">删除</button>
         </div>
       </div>
@@ -8953,8 +9266,8 @@ function renderHealth() {
   const s = settings();
   const data = memoryData();
   const issues = [];
-  if (!s.useSecondary || !s.secondaryUrl || !s.secondaryKey) issues.push('未完整配置副API：逐楼摘要、锚点和合并不会自动完成；本版本不会把后台记忆整理提示词发送给主模型。');
-  if (s.useEmbedding && !embeddingConfigured()) issues.push('已启用Embedding，但向量API地址/密钥不完整。');
+  if (!secondaryConfigured(s)) issues.push('未完整配置副API：逐楼摘要、锚点和合并不会自动完成；本版本不会把后台记忆整理提示词发送给主模型。');
+  if (s.useEmbedding && !embeddingConfigured()) issues.push('已启用Embedding，但向量API地址、密钥或模型不完整。');
   if (s.useEmbedding && state.vectorStorageUnavailable) issues.push('当前浏览器无法使用 IndexedDB：语义向量已自动停用，插件只使用关键词召回；不会把向量浮点数组写入聊天元数据。');
   if ((data.timeline?.warnings || []).length > 0) issues.push(`剧情时间连续性有 ${(data.timeline.warnings || []).length} 条待核对提示；回忆/梦境不会覆盖当前现实时间。最近一条：${data.timeline.warnings.at(-1)?.message || '请检查场景页'}`);
   if (s.useEmbedding) {
@@ -9461,7 +9774,7 @@ async function finalizeArchiveForTransfer(archiveName = '') {
   }
   const pendingCount = missingGodlogRepairRows(data).length;
   const unmergedCount = mergeCycleMaterials(data).length;
-  if ((pendingCount > 0 || unmergedCount > 0) && (!s.useSecondary || !s.secondaryUrl || !s.secondaryKey)) {
+  if ((pendingCount > 0 || unmergedCount > 0) && (!secondaryConfigured(s))) {
     toastr?.warning?.('当前档案仍有待补摘要或待合并内容，请先配置并启用副API后再整理。', 'Anchor Memory');
     return false;
   }
@@ -9575,6 +9888,10 @@ async function loadArchive(archiveName = '') {
     toastr?.warning?.('这个档案还没有完成“补齐摘要并全量合并”，为避免旧档第1楼与新档第1楼混淆，当前禁止直接加载。请先回原聊天完成全量整理。', 'Anchor Memory');
     return;
   }
+  if (archiveMatchesCurrentChat(archive, hasPersistentChatContext() ? memoryData() : null)) {
+    toastr?.warning?.('这是该档案的原聊天。为防止精简转档副本覆盖原聊天的逐楼摘要、分段锚点和详细状态，当前禁止加载回原聊天；请到新的开场聊天中加载。', 'Anchor Memory');
+    return;
+  }
   if (!confirm(`加载档案「${charName} / ${archiveName}」会替换当前聊天内的 Anchor Memory 数据。将只带入最终累计全量记忆和人物、物品、场景状态，不带入旧逐楼摘要。继续？`)) return;
   const ctx = getContext();
   if (!ctx.chatMetadata) ctx.chatMetadata = {};
@@ -9624,6 +9941,59 @@ async function rebuildVectors() {
   updatePreview();
 }
 
+function syncSecondaryInputsFromUi({ clearModel = false } = {}) {
+  const s = settings();
+  const urlInput = $('#am_secondary_url');
+  const keyInput = $('#am_secondary_key');
+  const modelInput = $('#am_secondary_model');
+  if (urlInput.length) s.secondaryUrl = String(urlInput.val() || '').trim();
+  if (keyInput.length) s.secondaryKey = String(keyInput.val() || '').trim();
+  if (clearModel) {
+    s.secondaryModel = '';
+    s.secondaryModels = [];
+    modelInput.val('');
+    renderModelOptions('#am_secondary_model_options', []);
+  } else if (modelInput.length) {
+    s.secondaryModel = String(modelInput.val() || '').trim();
+  }
+  saveSettingsDebounced();
+  return s;
+}
+
+function syncEmbeddingInputsFromUi({ clearModel = false } = {}) {
+  const s = settings();
+  const urlInput = $('#am_embedding_url');
+  const keyInput = $('#am_embedding_key');
+  const modelInput = $('#am_embedding_model');
+  if (urlInput.length) s.embeddingUrl = String(urlInput.val() || '').trim();
+  if (keyInput.length) s.embeddingKey = String(keyInput.val() || '').trim();
+  if (clearModel) {
+    s.embeddingModel = '';
+    s.embeddingModels = [];
+    modelInput.val('');
+    renderModelOptions('#am_embedding_model_options', []);
+  } else if (modelInput.length) {
+    s.embeddingModel = String(modelInput.val() || '').trim();
+  }
+  saveSettingsDebounced();
+  return s;
+}
+
+function setButtonBusy(selector, busy, busyText = '') {
+  const button = $(selector);
+  if (!button.length) return;
+  if (busy) {
+    if (button.data('am-original-text') === undefined) button.data('am-original-text', button.text());
+    button.prop('disabled', true);
+    if (busyText) button.text(busyText);
+  } else {
+    button.prop('disabled', false);
+    const original = button.data('am-original-text');
+    if (original !== undefined) button.text(original);
+    button.removeData('am-original-text');
+  }
+}
+
 function selectFetchedModel(current, models) {
   const value = String(current || '').trim();
   if (!Array.isArray(models) || models.length === 0) return value;
@@ -9631,47 +10001,63 @@ function selectFetchedModel(current, models) {
 }
 
 async function fetchSecondaryModels() {
-  const s = settings();
+  // Read the DOM synchronously before the mobile keyboard/blur lifecycle can leave settings stale.
+  // The user explicitly requested a clean model field for every new pull.
+  const s = syncSecondaryInputsFromUi({ clearModel: true });
   if (!s.secondaryUrl || !s.secondaryKey) {
     toastr?.warning?.('请先填写副API地址和密钥', 'Anchor Memory');
     return;
   }
+  setButtonBusy('#am_fetch_secondary_models', true, '正在拉取…');
   try {
-    showStatus('正在拉取副API模型...');
+    showStatus('正在通过酒馆后端拉取副API模型...');
     const models = await fetchProviderModels(s.secondaryUrl, s.secondaryKey, 'chat');
     s.secondaryModels = models;
-    s.secondaryModel = selectFetchedModel(s.secondaryModel, models);
+    s.secondaryModel = selectFetchedModel('', models);
     saveSettingsDebounced();
     renderModelOptions('#am_secondary_model_options', models);
-    $('#am_secondary_model').val(s.secondaryModel);
-    toastr?.success?.(`已拉取 ${models.length} 个副API模型`, 'Anchor Memory');
+    $('#am_secondary_model').val(s.secondaryModel).trigger('change');
+    toastr?.success?.(`已拉取 ${models.length} 个副API模型，并自动选择 ${s.secondaryModel}`, 'Anchor Memory');
   } catch (err) {
-    toastr?.error?.(`模型拉取失败：${err.message}`, 'Anchor Memory');
+    s.secondaryModels = [];
+    s.secondaryModel = '';
+    saveSettingsDebounced();
+    $('#am_secondary_model').val('');
+    renderModelOptions('#am_secondary_model_options', []);
+    toastr?.error?.(`模型拉取失败：${err.message}。模型栏已清空，可修正地址/密钥后重试，或手动粘贴准确模型名。`, 'Anchor Memory');
   } finally {
+    setButtonBusy('#am_fetch_secondary_models', false);
     updatePreview();
   }
 }
 
 async function fetchEmbeddingModels() {
-  const s = settings();
+  const s = syncEmbeddingInputsFromUi({ clearModel: true });
   const url = s.embeddingUrl || s.secondaryUrl;
   const key = s.embeddingKey || s.secondaryKey;
   if (!url || !key) {
     toastr?.warning?.('请先填写Embedding API地址和密钥', 'Anchor Memory');
     return;
   }
+  setButtonBusy('#am_fetch_embedding_models', true, '正在拉取…');
   try {
     showStatus('正在拉取Embedding模型...');
     const models = await fetchProviderModels(url, key, 'embedding');
     s.embeddingModels = models;
-    s.embeddingModel = selectFetchedModel(s.embeddingModel, models);
+    s.embeddingModel = selectFetchedModel('', models);
     saveSettingsDebounced();
     renderModelOptions('#am_embedding_model_options', models);
-    $('#am_embedding_model').val(s.embeddingModel);
+    $('#am_embedding_model').val(s.embeddingModel).trigger('change');
     toastr?.success?.(`已拉取 ${models.length} 个Embedding模型`, 'Anchor Memory');
   } catch (err) {
+    s.embeddingModels = [];
+    s.embeddingModel = '';
+    saveSettingsDebounced();
+    $('#am_embedding_model').val('');
+    renderModelOptions('#am_embedding_model_options', []);
     toastr?.error?.(`模型拉取失败：${err.message}`, 'Anchor Memory');
   } finally {
+    setButtonBusy('#am_fetch_embedding_models', false);
     updatePreview();
   }
 }
@@ -9690,6 +10076,8 @@ function applySiliconFlowEmbeddingPreset() {
 }
 
 async function testEmbedding() {
+  syncSecondaryInputsFromUi();
+  syncEmbeddingInputsFromUi();
   if (!embeddingConfigured()) {
     toastr?.warning?.('请先启用Embedding，并填写Embedding API或副API', 'Anchor Memory');
     return;
@@ -9707,9 +10095,9 @@ async function testEmbedding() {
 }
 
 async function testSecondary() {
-  const s = settings();
-  if (!s.useSecondary || !s.secondaryUrl || !s.secondaryKey) {
-    toastr?.warning?.('请先启用副API并填写地址/密钥', 'Anchor Memory');
+  const s = syncSecondaryInputsFromUi();
+  if (!secondaryConfigured(s)) {
+    toastr?.warning?.('请先启用副API并填写地址、密钥和模型', 'Anchor Memory');
     return;
   }
   try {
@@ -9872,7 +10260,7 @@ async function saveTrackedCharacterSettings() {
   updatePreview();
   await injectMemory().catch(console.warn);
   const s = settings();
-  if (s.useSecondary && s.secondaryUrl && s.secondaryKey) {
+  if (secondaryConfigured(s)) {
     const rebuilt = await rebuildCodexFromGodlogs(false);
     if (rebuilt) toastr?.success?.(`已保存追踪名单：${trackedCharacterLabel(memoryData())}`, 'Anchor Memory');
     else toastr?.warning?.('追踪名单已保存；索引仍在等待安全重建。', 'Anchor Memory');
@@ -10346,19 +10734,48 @@ function bindUi() {
   $('#am_inject_important_items').on('change', function () { saveSetting('injectImportantItems', this.checked); injectMemory().catch(console.warn); });
   $('#am_use_secondary').on('change', function () {
     saveSetting('useSecondary', this.checked);
+    if (this.checked && secondaryConfigured()) queueMemoryJob('副API已启用，继续补齐记忆', 120);
   });
-  $('#am_secondary_url').on('change', function () { saveSetting('secondaryUrl', this.value.trim()); });
-  $('#am_secondary_key').on('change', function () { saveSetting('secondaryKey', this.value.trim()); });
-  $('#am_secondary_model').on('change', function () { saveSetting('secondaryModel', this.value.trim()); });
+  $('#am_secondary_url, #am_secondary_key').on('input change', function () {
+    const s = settings();
+    const key = this.id === 'am_secondary_url' ? 'secondaryUrl' : 'secondaryKey';
+    const value = String(this.value || '').trim();
+    if (s[key] !== value) {
+      s[key] = value;
+      // A model selected for another endpoint/key is unsafe. Clear it immediately instead of
+      // silently sending a stale model name after mobile users edit the connection fields.
+      s.secondaryModel = '';
+      s.secondaryModels = [];
+      $('#am_secondary_model').val('');
+      renderModelOptions('#am_secondary_model_options', []);
+      saveSettingsDebounced();
+    }
+  });
+  $('#am_secondary_model').on('input change', function () {
+    saveSetting('secondaryModel', this.value.trim());
+    if (secondaryConfigured()) queueMemoryJob('副API模型已配置，继续补齐记忆', 180);
+  });
   $('#am_fetch_secondary_models').on('click', fetchSecondaryModels);
   $('#am_use_embedding').on('change', function () {
     saveSetting('useEmbedding', this.checked);
     clearRecallPrefetch();
     prepareDynamicRecall().catch(console.warn);
   });
-  $('#am_embedding_url').on('change', function () { saveSetting('embeddingUrl', this.value.trim()); });
-  $('#am_embedding_key').on('change', function () { saveSetting('embeddingKey', this.value.trim()); });
-  $('#am_embedding_model').on('change', function () { saveSetting('embeddingModel', this.value.trim()); clearRecallPrefetch(); });
+  $('#am_embedding_url, #am_embedding_key').on('input change', function () {
+    const s = settings();
+    const key = this.id === 'am_embedding_url' ? 'embeddingUrl' : 'embeddingKey';
+    const value = String(this.value || '').trim();
+    if (s[key] !== value) {
+      s[key] = value;
+      s.embeddingModel = '';
+      s.embeddingModels = [];
+      $('#am_embedding_model').val('');
+      renderModelOptions('#am_embedding_model_options', []);
+      saveSettingsDebounced();
+      clearRecallPrefetch();
+    }
+  });
+  $('#am_embedding_model').on('input change', function () { saveSetting('embeddingModel', this.value.trim()); clearRecallPrefetch(); });
   $('#am_embedding_dimensions').on('change', function () { saveSetting('embeddingDimensions', Math.max(64, Number(this.value) || 256)); });
   $('#am_embedding_dimensions_mode').on('change', function () { saveSetting('embeddingDimensionsMode', this.value || 'auto'); });
   $('#am_embedding_top_k').on('change', function () { saveSetting('embeddingTopK', Math.max(1, Number(this.value) || 3)); });

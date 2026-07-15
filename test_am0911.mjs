@@ -5,8 +5,8 @@ const source = fs.readFileSync(new URL('./index.js', import.meta.url), 'utf8');
 const manifest = JSON.parse(fs.readFileSync(new URL('./manifest.json', import.meta.url), 'utf8'));
 const readme = fs.readFileSync(new URL('./README.md', import.meta.url), 'utf8');
 
-assert.equal(manifest.version, '0.9.11');
-assert.match(source, /const EXTENSION_VERSION = '0\.9\.11'/);
+assert.equal(manifest.version, '0.9.14');
+assert.match(source, /const EXTENSION_VERSION = '0\.9\.14'/);
 assert.match(source, /ACTIVE_SUMMARY_SOURCE_LOOKUP_GRACE_MS = 8000/);
 assert.match(source, /pendingGeneratedBody/);
 assert.match(source, /function remapGodlogSourceKey/);

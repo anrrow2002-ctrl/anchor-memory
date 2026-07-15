@@ -5,8 +5,8 @@ const source = fs.readFileSync(new URL('./index.js', import.meta.url), 'utf8');
 const manifest = JSON.parse(fs.readFileSync(new URL('./manifest.json', import.meta.url), 'utf8'));
 const readme = fs.readFileSync(new URL('./README.md', import.meta.url), 'utf8');
 
-assert.equal(manifest.version, '0.9.10');
-assert.match(source, /const EXTENSION_VERSION = '0\.9\.10'/);
+assert.equal(manifest.version, '0.9.14');
+assert.match(source, /const EXTENSION_VERSION = '0\.9\.14'/);
 assert.match(source, /ACTIVE_SUMMARY_SOURCE_LOOKUP_GRACE_MS = 8000/);
 assert.match(source, /pendingGeneratedBody/);
 assert.match(source, /function remapGodlogSourceKey/);
@@ -15,8 +15,8 @@ assert.match(source, /摘要已生成，正在等待酒馆确认源楼层稳定/
 assert.match(source, /function rebuildGodlogTimelinePartition/);
 assert.match(source, /trailingRows:/);
 assert.match(source, /function drainDueDerivedMemory/);
-assert.match(source, /function rewriteLatestMergeUnlocked/);
-assert.match(source, /没有可合并的新摘要，也没有可重写的累计锚点/);
+assert.match(source, /function rewriteMergeItemUnlocked/);
+assert.match(source, /没有新的逐楼摘要可做全量合并/);
 assert.match(source, /Number\(s\.mergeInterval\) === 100/);
 assert.match(source, /同一剧情日内、围绕同一目标\/冲突连续推进的多个场景，必须合并成一条完整事件链/);
 assert.match(source, /以下为已回退并验证的安全关系快照/);
@@ -203,7 +203,7 @@ console.log(JSON.stringify({
   legacy100MigratesTo: 75,
   mergePromptSameDayAggregation: 'pass',
   safeCodexSnapshotDuringTrailingSummary: 'pass',
-  manualRewriteWithoutNewCycle: 'pass',
+  cumulativeMergeCatchUp: 'pass',
   randomizedTrailingRebuildScenarios: trailingScenarios,
   randomizedInteriorGapScenarios: interiorGapScenarios,
   transientSourceReplacementScenarios: sourceReplacementScenarios,
