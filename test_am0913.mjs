@@ -4,8 +4,8 @@ import assert from 'node:assert/strict';
 const source = fs.readFileSync(new URL('./index.js', import.meta.url), 'utf8');
 const manifest = JSON.parse(fs.readFileSync(new URL('./manifest.json', import.meta.url), 'utf8'));
 
-assert.equal(manifest.version, '0.9.14');
-assert.match(source, /const EXTENSION_VERSION = '0\.9\.14'/);
+assert.equal(manifest.version, '0.9.16');
+assert.match(source, /const EXTENSION_VERSION = '0.9.16'/);
 assert.match(source, /function validateGodlogCandidate/);
 assert.match(source, /function buildGodlogCorrectionPrompt/);
 assert.match(source, /function extractSecondaryResponseText/);

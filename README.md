@@ -1,6 +1,25 @@
-# Anchor Memory 0.9.14 Full Runtime Audit
+# Anchor Memory 0.9.16 Secondary Response Compatibility Audit
 
 面向长篇 SillyTavern 角色扮演的分层锚点记忆插件。
+
+
+## 0.9.16 副API“成功但没有正文”兼容与诊断
+
+- 修复标准 OpenAI `choices` 外壳存在、`finish_reason=stop`，但正文位于 `reasoning_details`、`thinking/thinking_content`、`delta.reasoning_content`、`parts/summary` 等供应商扩展字段时，被误判为空响应的问题。
+- 正常 `message.content`、Responses API、Gemini parts 与 SSE 仍优先读取；只有正常正文确实为空时才回退到推理/思考字段，避免覆盖标准答案。
+- 空响应错误不再只列顶层 `id/object/choices/usage`，现在会显示 `choices[0]` 字段、`message` 字段、content 类型、tool_calls 数量、completion token 与 reasoning token 数。
+- 根据返回元数据直接区分：模型生成 0 token、仅生成推理 token、只返回 tool_calls、usage 显示生成过但正文被代理/兼容层剥离，以及真正的未知响应结构。
+- 不自动进行第二次付费请求；只有取得可读正文后，原有 Godlog/索引格式校验才可能执行一次纠正重写。
+- 数据版本保持 12，不改动 Godlog、锚点、累计合并、人物关系、人物/物品/场景索引、隐藏楼层状态或档案。
+
+## 0.9.15 索引超时与分段重建
+
+- `secondary-timeout` 不是副API返回的错误，而是旧插件在120秒后主动中止请求时泄漏出的内部原因字符串。新版兼容移动端/WebKit和Chromium的不同 AbortController 行为，明确区分插件超时、聊天切换取消与真实网络错误。
+- 人物/物品/场景及固定人物关系不再使用单次最多42,000字符的巨型全历史请求。重建按时间顺序拆成最多10楼/9,000字符一段，每段输出并校验完整当前状态。
+- 每段成功后保存候选索引、候选关系表和游标；刷新、切换聊天或单段超时不会丢掉已完成进度。全部分段成功前，当前正式索引不会被覆盖。
+- 自动重试采用15秒起的指数退避；同一分段连续三次无进展失败后停止自动调用，避免死循环扣费。玩家检查副API后可手动继续。
+- 新增历史污染边界：已索引的中间楼层被编辑、删除、重生成或手动重跑摘要后，旧累计表立即停止注入，直到完整重建成功；仅最新新增尾楼尚未写入索引时，才继续使用真正安全的旧快照。
+- 聊天数据版本升级到12，只新增重建游标、退避和安全边界字段；已有Godlog、锚点、合并、档案及正式索引原样迁移。
 
 ## 0.9.14 全链路自查与运行逻辑修复
 
@@ -182,7 +201,7 @@
 
 ## 安装
 
-为避免 SillyTavern 把它识别为第二个扩展，本安装包故意保留原目录名 `anchor-memory-0.9.11-REWRITE-CONTROLS`。请直接覆盖现有同名目录，不要与旧版并存；插件清单版本已经升级为 0.9.14。升级前可在“工具”页导出当前记忆 JSON；本次不改变聊天数据结构，已有 Godlog、锚点、合并、关系表和索引会保留。
+为避免 SillyTavern 把它识别为第二个扩展，本安装包故意保留原目录名 `anchor-memory-0.9.11-REWRITE-CONTROLS`。请直接覆盖现有同名目录，不要与旧版并存；插件清单版本已经升级为 0.9.16。升级前可在“工具”页导出当前记忆 JSON；聊天数据会自动迁移到版本12，只增加分段重建进度、退避和安全边界字段，已有 Godlog、锚点、合并、关系表和索引会保留。
 
 ## 自检
 
@@ -190,7 +209,8 @@
 
 ```bash
 node --check index.js
-node test_am0914.mjs
+node test_am0915.mjs
+node test_am0916.mjs
 ```
 
-完整运行逻辑自检见 `AUDIT-0.9.14.md` 与 `TEST-REPORT-0.9.14.md`；升级注意事项见 `UPGRADE-0.9.14.md`。
+本次专项自检见 `AUDIT-0.9.16.md`、`TEST-REPORT-0.9.16.md` 与 `UPGRADE-0.9.16.md`；0.9.15 及更早的审计文档仍保留。

@@ -115,7 +115,7 @@
       </section>
 
       <section class="am-tab-panel" data-panel="characters">
-        <div class="am-note">逐楼摘要完成后会自动刷新这里；不需要等分段锚点。升级、编辑或重建时会先保留最后一次有效索引，只有新索引完整生成并通过表格校验后才会替换。</div>
+        <div class="am-note">逐楼摘要完成后会自动刷新这里；不需要等分段锚点。安全重建会按最多10楼一段顺序处理并保存进度，失败、超时或刷新后可从未完成分段继续；全部分段完整通过前不会覆盖最后一次有效索引。连续三次无进展失败后会暂停自动重试，避免死循环扣费。</div>
         <div id="am_codex_status" class="am-note">正在读取索引状态……</div>
         <div class="am-actions">
           <button id="am_rebuild_codex">安全重建人物/物品/场景索引</button>

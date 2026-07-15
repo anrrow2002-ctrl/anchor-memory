@@ -6,8 +6,8 @@ const source = fs.readFileSync(new URL('./index.js', import.meta.url), 'utf8');
 const html = fs.readFileSync(new URL('./settings.html', import.meta.url), 'utf8');
 const manifest = JSON.parse(fs.readFileSync(new URL('./manifest.json', import.meta.url), 'utf8'));
 
-assert.equal(manifest.version, '0.9.14');
-assert.match(source, /const EXTENSION_VERSION = '0\.9\.14'/);
+assert.equal(manifest.version, '0.9.16');
+assert.match(source, /const EXTENSION_VERSION = '0.9.16'/);
 assert.match(source, /function secondaryConfigured/);
 assert.match(source, /String\(s\.secondaryModel \|\| ''\)\.trim\(\)/);
 assert.match(source, /副API响应成功但没有可用正文/);
@@ -169,4 +169,4 @@ assert.match(source, /mode: 'prompt-ready-history-hide'/);
 assert.match(source, /prune: true/);
 assert.match(source, /removeOutboundIndices/);
 
-console.log('Anchor Memory 0.9.14 full-audit regression tests passed.');
+console.log('Anchor Memory staged-rebuild regression tests passed.');
