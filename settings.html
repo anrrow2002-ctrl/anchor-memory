@@ -286,6 +286,25 @@
           启用副API后台写记忆
         </label>
         <div id="am_secondary_fields" class="am-panel am-panel-visible">
+          <div class="am-api-preset-box">
+            <label>已保存的副API预设
+              <select id="am_secondary_preset_select" class="text_pole">
+                <option value="">不使用已保存预设</option>
+              </select>
+            </label>
+            <label>预设名称
+              <input id="am_secondary_preset_name" class="text_pole" type="text" maxlength="60" placeholder="例如：硅基流动 / OpenRouter / 备用API" />
+            </label>
+            <div class="am-actions am-preset-actions">
+              <button id="am_save_secondary_preset" type="button">保存为新预设</button>
+              <button id="am_update_secondary_preset" type="button">覆盖所选预设</button>
+              <button id="am_delete_secondary_preset" type="button">删除所选预设</button>
+            </div>
+            <div id="am_secondary_preset_status" class="am-preset-status">尚未保存副API预设。</div>
+            <div class="am-note">
+              预设会保存在当前SillyTavern的Anchor Memory扩展设置中，包含URL、密钥、当前模型和模型列表，可在所有聊天间切换使用。为了避免泄露，插件的“导出配置”不会导出密钥或这些预设。
+            </div>
+          </div>
           <label>副API地址
             <input id="am_secondary_url" class="text_pole" type="text" placeholder="https://api.example.com/v1 或 https://api.example.com/v1/chat/completions" />
           </label>

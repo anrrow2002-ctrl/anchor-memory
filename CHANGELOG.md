@@ -1,3 +1,14 @@
+# Changelog
+
+## 0.9.17 - Secondary API named presets
+
+- Added named secondary-API presets containing URL, API key, selected model, and the fetched model list.
+- Presets are global to Anchor Memory and can be switched across chats without retyping credentials or fetching models again.
+- Added create, overwrite, and delete controls plus a dirty-state indicator when loaded fields have unsaved edits.
+- Switching presets advances a connection revision; late model-list results from an older URL/key are ignored and cannot overwrite the selected preset. Active memory writers are allowed to finish so switching does not create false summary/index failures.
+- Configuration export/import explicitly excludes API keys and saved secondary presets.
+- Added mobile one-column preset actions and migration/normalization for legacy settings.
+
 # 0.9.16
 
 - 兼容 `reasoning_details`、`thinking/thinking_content`、`delta.reasoning_content`、`parts/summary` 等 OpenAI 兼容供应商扩展输出字段，修复 `finish_reason=stop` 却被误判“没有可用正文”的问题。

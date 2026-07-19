@@ -143,7 +143,7 @@ function isGenerationActive() {
 
 
 const MODULE = 'anchor_memory';
-const EXTENSION_VERSION = '0.9.16';
+const EXTENSION_VERSION = '0.9.17';
 const DATA_KEY = 'anchorMemory';
 const CORE_PROMPT_KEY = 'anchor_memory_core';
 const RECALL_PROMPT_KEY = 'anchor_memory_recall';
@@ -309,6 +309,10 @@ const DEFAULT_SETTINGS = {
   secondaryKey: '',
   secondaryModel: '',
   secondaryModels: [],
+  // Named connection presets are global plugin settings, not chat memory. They intentionally include
+  // the API key because the feature exists to avoid retyping it; config export explicitly excludes them.
+  secondaryPresets: [],
+  activeSecondaryPresetId: '',
   // Main-model memory is deterministic by default: cumulative merge + active 15-turn anchors + subsequent per-turn summaries.
   // Dynamic recall and state tables remain optional because they can duplicate or resurrect stale facts.
   useDynamicRecall: false,
@@ -421,6 +425,8 @@ const state = {
   lastContextSize: 0,
   lastMemoryBudget: null,
   vectorStorageUnavailable: false,
+  // Guards async model-list results from overwriting a connection selected or edited later.
+  secondaryConfigRevision: 0,
 };
 
 function settings() {
@@ -437,6 +443,15 @@ function settings() {
       s[key] = value;
       changed = true;
     }
+  }
+  const normalizedSecondaryPresets = normalizeSecondaryPresetList(s.secondaryPresets);
+  if (JSON.stringify(s.secondaryPresets || []) !== JSON.stringify(normalizedSecondaryPresets)) {
+    s.secondaryPresets = normalizedSecondaryPresets;
+    changed = true;
+  }
+  if (!s.secondaryPresets.some(item => item.id === String(s.activeSecondaryPresetId || ''))) {
+    if (s.activeSecondaryPresetId) changed = true;
+    s.activeSecondaryPresetId = '';
   }
   const normalizedAnchorInterval = normalizeAnchorInterval(s.anchorInterval);
   const normalizedMergeInterval = normalizeMergeInterval(s.mergeInterval);
@@ -10309,8 +10324,229 @@ async function rebuildVectors() {
   updatePreview();
 }
 
+function normalizeSecondaryPresetName(value) {
+  return String(value || '')
+    .replace(/[\u0000-\u001f\u007f]/g, '')
+    .replace(/\s+/g, ' ')
+    .trim()
+    .slice(0, 60);
+}
+
+function makeSecondaryPresetId() {
+  try {
+    if (globalThis.crypto?.randomUUID) return `secondary-${globalThis.crypto.randomUUID()}`;
+  } catch {}
+  return `secondary-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`;
+}
+
+function normalizeSecondaryPresetRecord(record) {
+  if (!record || typeof record !== 'object' || Array.isArray(record)) return null;
+  const name = normalizeSecondaryPresetName(record.name);
+  if (!name) return null;
+  const models = [...new Set((Array.isArray(record.models) ? record.models : [])
+    .map(value => String(value || '').trim())
+    .filter(Boolean))].slice(0, 500);
+  const createdAt = Number(record.createdAt) > 0 ? Number(record.createdAt) : Date.now();
+  const updatedAt = Number(record.updatedAt) > 0 ? Number(record.updatedAt) : createdAt;
+  return {
+    id: String(record.id || '').trim() || makeSecondaryPresetId(),
+    name,
+    url: String(record.url || '').trim(),
+    key: String(record.key || ''),
+    model: String(record.model || '').trim(),
+    models,
+    createdAt,
+    updatedAt,
+  };
+}
+
+function normalizeSecondaryPresetList(value) {
+  const result = [];
+  const ids = new Set();
+  const names = new Set();
+  for (const raw of Array.isArray(value) ? value : []) {
+    const preset = normalizeSecondaryPresetRecord(raw);
+    if (!preset) continue;
+    const normalizedName = preset.name.toLocaleLowerCase();
+    if (ids.has(preset.id) || names.has(normalizedName)) continue;
+    ids.add(preset.id);
+    names.add(normalizedName);
+    result.push(preset);
+    if (result.length >= 50) break;
+  }
+  return result;
+}
+
+function secondaryPresetSnapshot(s = settings()) {
+  return {
+    url: String(s.secondaryUrl || '').trim(),
+    key: String(s.secondaryKey || ''),
+    model: String(s.secondaryModel || '').trim(),
+    models: [...new Set((Array.isArray(s.secondaryModels) ? s.secondaryModels : [])
+      .map(value => String(value || '').trim())
+      .filter(Boolean))].slice(0, 500),
+  };
+}
+
+function bumpSecondaryConfigRevision() {
+  state.secondaryConfigRevision = Math.max(0, Number(state.secondaryConfigRevision) || 0) + 1;
+  return state.secondaryConfigRevision;
+}
+
+function secondaryPresetConfigEquals(preset, s = settings()) {
+  if (!preset) return false;
+  const current = secondaryPresetSnapshot(s);
+  return preset.url === current.url
+    && preset.key === current.key
+    && preset.model === current.model
+    && JSON.stringify(preset.models || []) === JSON.stringify(current.models || []);
+}
+
+function activeSecondaryPreset(s = settings()) {
+  return (s.secondaryPresets || []).find(item => item.id === String(s.activeSecondaryPresetId || '')) || null;
+}
+
+function updateSecondaryPresetStatus() {
+  const status = $('#am_secondary_preset_status');
+  if (!status.length) return;
+  const s = settings();
+  const preset = activeSecondaryPreset(s);
+  status.removeClass('am-preset-dirty am-preset-ready');
+  if (!preset) {
+    const count = (s.secondaryPresets || []).length;
+    status.text(count ? `已保存 ${count} 个预设；当前字段未绑定预设。` : '尚未保存副API预设。');
+    return;
+  }
+  if (secondaryPresetConfigEquals(preset, s)) {
+    status.addClass('am-preset-ready').text(`正在使用预设「${preset.name}」。`);
+  } else {
+    status.addClass('am-preset-dirty').text(`预设「${preset.name}」已载入，但当前字段有未保存修改。`);
+  }
+}
+
+function renderSecondaryPresetOptions({ preserveNameInput = false } = {}) {
+  const s = settings();
+  const select = $('#am_secondary_preset_select');
+  if (!select.length) return;
+  const previousName = preserveNameInput ? String($('#am_secondary_preset_name').val() || '') : '';
+  select.empty().append($('<option>').val('').text('不使用已保存预设'));
+  for (const preset of s.secondaryPresets || []) {
+    select.append($('<option>').val(preset.id).text(preset.name));
+  }
+  select.val(activeSecondaryPreset(s)?.id || '');
+  if (preserveNameInput) $('#am_secondary_preset_name').val(previousName);
+  else $('#am_secondary_preset_name').val(activeSecondaryPreset(s)?.name || '');
+  updateSecondaryPresetStatus();
+}
+
+function loadSecondaryPreset(presetId) {
+  const s = settings();
+  const id = String(presetId || '');
+  if (!id) {
+    s.activeSecondaryPresetId = '';
+    saveSettingsDebounced();
+    $('#am_secondary_preset_name').val('');
+    updateSecondaryPresetStatus();
+    return;
+  }
+  const preset = (s.secondaryPresets || []).find(item => item.id === id);
+  if (!preset) {
+    s.activeSecondaryPresetId = '';
+    saveSettingsDebounced();
+    renderSecondaryPresetOptions();
+    toastr?.warning?.('所选副API预设已经不存在。', 'Anchor Memory');
+    return;
+  }
+
+  // Do not abort active memory writers: their result is still valid for the same chat facts.
+  // Instead, advance the connection revision so any older model-list result is ignored on arrival.
+  clearRecallPrefetch();
+
+  s.secondaryUrl = preset.url;
+  s.secondaryKey = preset.key;
+  s.secondaryModel = preset.model;
+  s.secondaryModels = [...(preset.models || [])];
+  s.activeSecondaryPresetId = preset.id;
+  bumpSecondaryConfigRevision();
+  saveSettingsDebounced();
+
+  $('#am_secondary_url').val(s.secondaryUrl);
+  $('#am_secondary_key').val(s.secondaryKey);
+  $('#am_secondary_model').val(s.secondaryModel);
+  renderModelOptions('#am_secondary_model_options', s.secondaryModels);
+  $('#am_secondary_preset_name').val(preset.name);
+  updateSecondaryPresetStatus();
+  updatePreview();
+  toastr?.success?.(`已切换到副API预设「${preset.name}」`, 'Anchor Memory');
+  if (s.useSecondary && secondaryConfigured(s)) queueMemoryJob(`已切换副API预设「${preset.name}」`, 180);
+}
+
+function saveSecondaryPreset({ overwriteActive = false } = {}) {
+  const s = syncSecondaryInputsFromUi({ clearModel: false });
+  const name = normalizeSecondaryPresetName($('#am_secondary_preset_name').val());
+  if (!name) {
+    toastr?.warning?.('请先填写预设名称。', 'Anchor Memory');
+    $('#am_secondary_preset_name').trigger('focus');
+    return;
+  }
+  const snapshot = secondaryPresetSnapshot(s);
+  if (!snapshot.url || !snapshot.key) {
+    toastr?.warning?.('至少填写副API地址和密钥后才能保存预设。', 'Anchor Memory');
+    return;
+  }
+
+  let target = overwriteActive ? activeSecondaryPreset(s) : null;
+  const sameName = (s.secondaryPresets || []).find(item => item.name.toLocaleLowerCase() === name.toLocaleLowerCase());
+  if (overwriteActive && !target) {
+    toastr?.warning?.('请先从下拉框选择要覆盖的预设。', 'Anchor Memory');
+    return;
+  }
+  if (sameName && (!target || sameName.id !== target.id)) {
+    if (overwriteActive) {
+      toastr?.warning?.(`预设名称「${sameName.name}」已被其他预设使用，请换一个名称。`, 'Anchor Memory');
+      return;
+    }
+    if (!confirm(`已经存在名为「${sameName.name}」的副API预设，是否覆盖它？`)) return;
+    target = sameName;
+  }
+
+  const now = Date.now();
+  const record = {
+    id: target?.id || makeSecondaryPresetId(),
+    name,
+    ...snapshot,
+    createdAt: target?.createdAt || now,
+    updatedAt: now,
+  };
+  const next = [...(s.secondaryPresets || [])];
+  const index = next.findIndex(item => item.id === record.id);
+  if (index >= 0) next[index] = record;
+  else next.push(record);
+  s.secondaryPresets = normalizeSecondaryPresetList(next);
+  s.activeSecondaryPresetId = record.id;
+  saveSettingsDebounced();
+  renderSecondaryPresetOptions();
+  toastr?.success?.(`${target ? '已更新' : '已保存'}副API预设「${record.name}」`, 'Anchor Memory');
+}
+
+function deleteSecondaryPreset() {
+  const s = settings();
+  const preset = activeSecondaryPreset(s);
+  if (!preset) {
+    toastr?.warning?.('请先选择要删除的副API预设。', 'Anchor Memory');
+    return;
+  }
+  if (!confirm(`删除副API预设「${preset.name}」？当前输入框里的配置不会被清空。`)) return;
+  s.secondaryPresets = (s.secondaryPresets || []).filter(item => item.id !== preset.id);
+  s.activeSecondaryPresetId = '';
+  saveSettingsDebounced();
+  renderSecondaryPresetOptions();
+  toastr?.success?.(`已删除副API预设「${preset.name}」`, 'Anchor Memory');
+}
+
 function syncSecondaryInputsFromUi({ clearModel = false } = {}) {
   const s = settings();
+  const before = JSON.stringify(secondaryPresetSnapshot(s));
   const urlInput = $('#am_secondary_url');
   const keyInput = $('#am_secondary_key');
   const modelInput = $('#am_secondary_model');
@@ -10324,6 +10560,7 @@ function syncSecondaryInputsFromUi({ clearModel = false } = {}) {
   } else if (modelInput.length) {
     s.secondaryModel = String(modelInput.val() || '').trim();
   }
+  if (before !== JSON.stringify(secondaryPresetSnapshot(s))) bumpSecondaryConfigRevision();
   saveSettingsDebounced();
   return s;
 }
@@ -10370,8 +10607,10 @@ function selectFetchedModel(current, models) {
 
 async function fetchSecondaryModels() {
   // Read the DOM synchronously before the mobile keyboard/blur lifecycle can leave settings stale.
-  // The user explicitly requested a clean model field for every new pull.
+  // Every pull starts from a clean model field. A revision guard prevents a late result from an old
+  // URL/key from overwriting a preset or manual edit selected while the request was in flight.
   const s = syncSecondaryInputsFromUi({ clearModel: true });
+  const requestRevision = Number(state.secondaryConfigRevision) || 0;
   if (!s.secondaryUrl || !s.secondaryKey) {
     toastr?.warning?.('请先填写副API地址和密钥', 'Anchor Memory');
     return;
@@ -10380,21 +10619,34 @@ async function fetchSecondaryModels() {
   try {
     showStatus('正在通过酒馆后端拉取副API模型...');
     const models = await fetchProviderModels(s.secondaryUrl, s.secondaryKey, 'chat');
+    if (requestRevision !== Number(state.secondaryConfigRevision || 0)) {
+      console.info('[AnchorMemory] ignored stale secondary model list after connection changed');
+      return;
+    }
     s.secondaryModels = models;
     s.secondaryModel = selectFetchedModel('', models);
+    bumpSecondaryConfigRevision();
     saveSettingsDebounced();
     renderModelOptions('#am_secondary_model_options', models);
-    $('#am_secondary_model').val(s.secondaryModel).trigger('change');
+    $('#am_secondary_model').val(s.secondaryModel);
+    updateSecondaryPresetStatus();
+    if (secondaryConfigured(s)) queueMemoryJob('副API模型已配置，继续补齐记忆', 180);
     toastr?.success?.(`已拉取 ${models.length} 个副API模型，并自动选择 ${s.secondaryModel}`, 'Anchor Memory');
   } catch (err) {
+    if (requestRevision !== Number(state.secondaryConfigRevision || 0) || err?.code === 'AM_REQUEST_CANCELLED') {
+      console.info('[AnchorMemory] secondary model pull cancelled or superseded; current configuration preserved');
+      return;
+    }
     s.secondaryModels = [];
     s.secondaryModel = '';
+    bumpSecondaryConfigRevision();
     saveSettingsDebounced();
     $('#am_secondary_model').val('');
     renderModelOptions('#am_secondary_model_options', []);
     toastr?.error?.(`模型拉取失败：${err.message}。模型栏已清空，可修正地址/密钥后重试，或手动粘贴准确模型名。`, 'Anchor Memory');
   } finally {
     setButtonBusy('#am_fetch_secondary_models', false);
+    updateSecondaryPresetStatus();
     updatePreview();
   }
 }
@@ -10708,7 +10960,7 @@ function exportConfig() {
   const s = settings();
   const safeConfig = {};
   for (const key of Object.keys(DEFAULT_SETTINGS)) {
-    if (['secondaryKey', 'embeddingKey', 'slots'].includes(key)) continue;
+    if (['secondaryKey', 'embeddingKey', 'secondaryPresets', 'activeSecondaryPresetId', 'slots'].includes(key)) continue;
     safeConfig[key] = s[key];
   }
   $('#am_json_box').val(JSON.stringify({
@@ -10726,7 +10978,7 @@ async function importConfig() {
     const incoming = imported.settings || imported;
     const s = settings();
     for (const key of Object.keys(DEFAULT_SETTINGS)) {
-      if (['secondaryKey', 'embeddingKey', 'slots'].includes(key)) continue;
+      if (['secondaryKey', 'embeddingKey', 'secondaryPresets', 'activeSecondaryPresetId', 'slots'].includes(key)) continue;
       if (incoming[key] !== undefined) s[key] = incoming[key];
     }
     saveSettingsDebounced();
@@ -11039,6 +11291,7 @@ function loadUi() {
   $('#am_secondary_key').val(s.secondaryKey);
   $('#am_secondary_model').val(s.secondaryModel);
   renderModelOptions('#am_secondary_model_options', s.secondaryModels || []);
+  renderSecondaryPresetOptions();
   $('#am_use_embedding').prop('checked', !!s.useEmbedding);
   $('#am_embedding_url').val(s.embeddingUrl);
   $('#am_embedding_key').val(s.embeddingKey);
@@ -11104,6 +11357,10 @@ function bindUi() {
     saveSetting('useSecondary', this.checked);
     if (this.checked && secondaryConfigured()) queueMemoryJob('副API已启用，继续补齐记忆', 120);
   });
+  $('#am_secondary_preset_select').on('change', function () { loadSecondaryPreset(this.value); });
+  $('#am_save_secondary_preset').on('click', () => saveSecondaryPreset({ overwriteActive: false }));
+  $('#am_update_secondary_preset').on('click', () => saveSecondaryPreset({ overwriteActive: true }));
+  $('#am_delete_secondary_preset').on('click', deleteSecondaryPreset);
   $('#am_secondary_url, #am_secondary_key').on('input change', function () {
     const s = settings();
     const key = this.id === 'am_secondary_url' ? 'secondaryUrl' : 'secondaryKey';
@@ -11116,11 +11373,20 @@ function bindUi() {
       s.secondaryModels = [];
       $('#am_secondary_model').val('');
       renderModelOptions('#am_secondary_model_options', []);
+      bumpSecondaryConfigRevision();
       saveSettingsDebounced();
+      updateSecondaryPresetStatus();
     }
   });
   $('#am_secondary_model').on('input change', function () {
-    saveSetting('secondaryModel', this.value.trim());
+    const s = settings();
+    const value = this.value.trim();
+    if (s.secondaryModel !== value) {
+      s.secondaryModel = value;
+      bumpSecondaryConfigRevision();
+      saveSettingsDebounced();
+    }
+    updateSecondaryPresetStatus();
     if (secondaryConfigured()) queueMemoryJob('副API模型已配置，继续补齐记忆', 180);
   });
   $('#am_fetch_secondary_models').on('click', fetchSecondaryModels);

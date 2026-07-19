@@ -499,6 +499,32 @@
   margin: 5px 0;
 }
 
+.anchor-memory-settings .am-api-preset-box {
+  margin-bottom: 10px;
+  padding: 8px;
+  border: 1px solid color-mix(in srgb, var(--SmartThemeBorderColor) 72%, var(--am-accent));
+  border-radius: 7px;
+  background: color-mix(in srgb, var(--SmartThemeBlurTintColor, #1f1f1f) 94%, var(--am-accent));
+}
+
+.anchor-memory-settings .am-preset-status {
+  margin: 6px 0;
+  min-height: 1.4em;
+  font-size: 12px;
+  line-height: 1.4;
+  opacity: 0.82;
+}
+
+.anchor-memory-settings .am-preset-status.am-preset-ready {
+  color: var(--am-accent);
+  opacity: 1;
+}
+
+.anchor-memory-settings .am-preset-status.am-preset-dirty {
+  color: var(--am-warn);
+  opacity: 1;
+}
+
 .anchor-memory-settings .am-actions {
   display: flex;
   flex-wrap: wrap;
@@ -884,6 +910,10 @@ body.am-workbench-open {
     margin: 0;
     white-space: normal;
     overflow-wrap: anywhere;
+  }
+
+  .anchor-memory-settings .am-preset-actions {
+    grid-template-columns: 1fr;
   }
 
   .anchor-memory-settings .am-actions > input,

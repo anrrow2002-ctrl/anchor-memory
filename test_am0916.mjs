@@ -5,8 +5,8 @@ import vm from 'node:vm';
 const source = fs.readFileSync(new URL('./index.js', import.meta.url), 'utf8');
 const manifest = JSON.parse(fs.readFileSync(new URL('./manifest.json', import.meta.url), 'utf8'));
 
-assert.equal(manifest.version, '0.9.16');
-assert.match(source, /const EXTENSION_VERSION = '0.9.16'/);
+assert.equal(manifest.version, '0.9.17');
+assert.match(source, /const EXTENSION_VERSION = '0.9.17'/);
 assert.match(source, /function secondaryResponseDiagnostics/);
 assert.match(source, /function secondaryEmptyResponseHint/);
 assert.match(source, /reasoning_details/);
@@ -58,4 +58,4 @@ const toolOnly = {
 };
 assert.match(api.secondaryEmptyResponseHint(toolOnly), /只返回了tool_calls/);
 
-console.log('Anchor Memory 0.9.16 secondary response compatibility and diagnostics tests passed.');
+console.log('Anchor Memory 0.9.17 secondary response compatibility and diagnostics tests passed.');

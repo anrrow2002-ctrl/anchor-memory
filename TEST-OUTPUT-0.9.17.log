@@ -1,0 +1,258 @@
+== test_am092.mjs ==
+{
+  "normal90": {
+    "gaps": 0,
+    "merged": 75
+  },
+  "delayed4": {
+    "gaps": 0,
+    "fallbackAnchors": 2
+  },
+  "missing39": {
+    "gaps": 0,
+    "merged": 75,
+    "fallbackKeys": [
+      39
+    ]
+  },
+  "interval15to10": {
+    "gaps": 0,
+    "merged": 75
+  },
+  "legacy097": {
+    "firstGapAt": 42,
+    "missing": [
+      39
+    ]
+  },
+  "entityStressMs": 15
+}
+== test_am093.mjs ==
+{
+  "normal90": {
+    "gaps": 0,
+    "merged": 75
+  },
+  "delayed4": {
+    "gaps": 0,
+    "fallbackAnchors": 2
+  },
+  "missing39": {
+    "gaps": 0,
+    "merged": 75,
+    "fallbackKeys": [
+      39
+    ]
+  },
+  "interval15to10": {
+    "gaps": 0,
+    "merged": 75
+  },
+  "legacy097": {
+    "firstGapAt": 42,
+    "missing": [
+      39
+    ]
+  },
+  "entityStressMs": 16.7
+}
+== test_am095.mjs ==
+{
+  "normal90": {
+    "gaps": 0,
+    "merged": 75
+  },
+  "delayed4": {
+    "gaps": 0,
+    "fallbackAnchors": 2
+  },
+  "missing39": {
+    "gaps": 0,
+    "merged": 75,
+    "fallbackKeys": [
+      39
+    ]
+  },
+  "interval15to10": {
+    "gaps": 0,
+    "merged": 75
+  },
+  "legacy097": {
+    "firstGapAt": 42,
+    "missing": [
+      39
+    ]
+  },
+  "entityStressMs": 15.9
+}
+== test_am096.mjs ==
+{
+  "normal90": {
+    "gaps": 0,
+    "merged": 75
+  },
+  "delayed4": {
+    "gaps": 0,
+    "fallbackAnchors": 2
+  },
+  "missing39": {
+    "gaps": 0,
+    "merged": 75,
+    "fallbackKeys": [
+      39
+    ]
+  },
+  "interval15to10": {
+    "gaps": 0,
+    "merged": 75
+  },
+  "legacy097": {
+    "firstGapAt": 42,
+    "missing": [
+      39
+    ]
+  },
+  "entityStressMs": 17.2
+}
+== test_am097.mjs ==
+{
+  "normal90": {
+    "gaps": 0,
+    "merged": 75
+  },
+  "delayed4": {
+    "gaps": 0,
+    "fallbackAnchors": 2
+  },
+  "missing39": {
+    "gaps": 0,
+    "merged": 75,
+    "fallbackKeys": [
+      39
+    ]
+  },
+  "interval15to10": {
+    "gaps": 0,
+    "merged": 75
+  },
+  "legacy097": {
+    "firstGapAt": 42,
+    "missing": [
+      39
+    ]
+  },
+  "entityStressMs": 16.2
+}
+== test_am098.mjs ==
+{
+  "normal90": {
+    "gaps": 0,
+    "merged": 75
+  },
+  "delayed4": {
+    "gaps": 0,
+    "fallbackAnchors": 2
+  },
+  "missing39": {
+    "gaps": 0,
+    "merged": 75,
+    "fallbackKeys": [
+      39
+    ]
+  },
+  "interval15to10": {
+    "gaps": 0,
+    "merged": 75
+  },
+  "legacy097": {
+    "firstGapAt": 42,
+    "missing": [
+      39
+    ]
+  },
+  "entityStressMs": 17.5
+}
+== test_am099.mjs ==
+{
+  "version": "0.9.17",
+  "promptInjection": {
+    "cycles": 1200,
+    "finalHookCycles": 832,
+    "fallbackOnlyCycles": 216,
+    "disabledCycles": 152,
+    "failures": 0
+  },
+  "memoryContinuity": {
+    "randomizedScenarios": 700,
+    "promptBoundaries": 157567,
+    "mergedTurnsObserved": 121301,
+    "gaps": 0,
+    "elapsedMs": 2958.6
+  },
+  "dynamicRecall": {
+    "cycles": 1500,
+    "semanticBeforeSend": 399,
+    "keywordFallbackBeforeSend": 1101,
+    "maxWaitMs": 1800,
+    "lateUncoveredCycles": 0
+  },
+  "masterToggle": {
+    "cycles": 300,
+    "dataLoss": 0,
+    "stalePromptsWhilePaused": 0,
+    "managedHiddenRowsLeftBehind": 0,
+    "pauseDuringGenerationRaceCycles": 400,
+    "hiddenStateRaceCycles": 300
+  }
+}
+== test_am0910.mjs ==
+{
+  "version": "0.9.17",
+  "relationshipTailRebuild": "pass",
+  "transientSourceResolution": "pass",
+  "confirmedDeletionGuard": "pass",
+  "cumulativeMergesAt150": 2,
+  "legacy100MigratesTo": 75,
+  "mergePromptSameDayAggregation": "pass",
+  "safeCodexSnapshotDuringTrailingSummary": "pass",
+  "cumulativeMergeCatchUp": "pass",
+  "randomizedTrailingRebuildScenarios": 2000,
+  "randomizedInteriorGapScenarios": 1976,
+  "transientSourceReplacementScenarios": 3000,
+  "randomizedMergeScenarios": 2500,
+  "totalExpectedCumulativeMerges": 15654
+}
+== test_am0911.mjs ==
+{
+  "version": "0.9.17",
+  "relationshipTailRebuild": "pass",
+  "transientSourceResolution": "pass",
+  "confirmedDeletionGuard": "pass",
+  "cumulativeMergesAt150": 2,
+  "legacy100MigratesTo": 75,
+  "mergePromptSameDayAggregation": "pass",
+  "safeCodexSnapshotDuringTrailingSummary": "pass",
+  "explicitAnchorRewriteControls": "pass",
+  "explicitMergeRewriteControls": "pass",
+  "transactionalDependencyRollback": "pass",
+  "randomizedRewriteCascadeScenarios": 5000,
+  "randomizedTrailingRebuildScenarios": 2000,
+  "randomizedInteriorGapScenarios": 1976,
+  "transientSourceReplacementScenarios": 3000,
+  "randomizedMergeScenarios": 2500,
+  "totalExpectedCumulativeMerges": 15388
+}
+== test_am0912.mjs ==
+Anchor Memory 0.9.12 archive-final-merge tests passed.
+== test_am0913.mjs ==
+Anchor Memory 0.9.13 summary validation tests passed.
+== test_am0914.mjs ==
+Anchor Memory staged-rebuild regression tests passed.
+== test_am0915.mjs ==
+Anchor Memory timeout, staged rebuild, retry and safe-snapshot tests passed.
+== test_am0916.mjs ==
+Anchor Memory 0.9.17 secondary response compatibility and diagnostics tests passed.
+== test_am0917.mjs ==
+Anchor Memory 0.9.17 secondary API preset tests passed.
+[AnchorMemory] ignored stale secondary model list after connection changed
+Anchor Memory 0.9.17 stale model-list race test passed.

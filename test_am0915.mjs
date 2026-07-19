@@ -5,8 +5,8 @@ import vm from 'node:vm';
 const source = fs.readFileSync(new URL('./index.js', import.meta.url), 'utf8');
 const manifest = JSON.parse(fs.readFileSync(new URL('./manifest.json', import.meta.url), 'utf8'));
 
-assert.equal(manifest.version, '0.9.16');
-assert.match(source, /const EXTENSION_VERSION = '0\.9\.16'/);
+assert.equal(manifest.version, '0.9.17');
+assert.match(source, /const EXTENSION_VERSION = '0\.9\.17'/);
 assert.match(source, /const DATA_VERSION = 12/);
 
 // Timeout classification: never leak the internal abort token and classify every aborted signal.
