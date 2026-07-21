@@ -7,7 +7,7 @@
   "js": "index.js",
   "css": "style.css",
   "author": "Anchor Memory custom build",
-  "version": "0.9.18",
+  "version": "0.9.19",
   "homePage": "",
   "auto_update": false,
   "hooks": {

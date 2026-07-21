@@ -143,7 +143,7 @@ function isGenerationActive() {
 
 
 const MODULE = 'anchor_memory';
-const EXTENSION_VERSION = '0.9.18';
+const EXTENSION_VERSION = '0.9.19';
 const DATA_KEY = 'anchorMemory';
 const CORE_PROMPT_KEY = 'anchor_memory_core';
 const RECALL_PROMPT_KEY = 'anchor_memory_recall';
@@ -427,6 +427,9 @@ const state = {
   vectorStorageUnavailable: false,
   // Guards async model-list results from overwriting a connection selected or edited later.
   secondaryConfigRevision: 0,
+  navbarObserver: null,
+  navbarObservedHost: null,
+  navbarRepairTimer: null,
 };
 
 function settings() {
@@ -11229,45 +11232,150 @@ function installPublicApi() {
   });
 }
 
+const NAVBAR_USER_TARGET_SELECTORS = [
+  '#user-settings-button',
+  '#userSettingsButton',
+  '#user_settings_button',
+  '#persona-management-button',
+  '#personaManagementButton',
+  '#persona_management_button',
+  '#PersonaManagementButton',
+  '[data-i18n="[title]User Settings"]',
+  '[data-i18n="[title]Persona Management"]',
+  '[title="用户信息"]',
+  '[title*="用户信息"]',
+  '[aria-label*="用户信息"]',
+  '[title*="User Settings"]',
+  '[aria-label*="User Settings"]',
+  '[title*="Persona Management"]',
+  '[aria-label*="Persona Management"]',
+];
+
+function topLevelNavbarChild(holder, candidate) {
+  const host = holder?.[0];
+  let node = candidate?.[0];
+  if (!host || !node || !host.contains(node)) return null;
+  while (node.parentElement && node.parentElement !== host) node = node.parentElement;
+  return node.parentElement === host ? $(node) : null;
+}
+
+function navbarUserReference(holder) {
+  if (!holder?.length) return null;
+  for (const selector of NAVBAR_USER_TARGET_SELECTORS) {
+    const matches = holder.find(selector).addBack(selector);
+    const candidate = matches.filter(':visible').first().length ? matches.filter(':visible').first() : matches.first();
+    const topLevel = topLevelNavbarChild(holder, candidate);
+    if (topLevel?.length && !topLevel.is('#anchor_memory_nav_button')) return topLevel;
+  }
+
+  // Theme compatibility: some beautification packs remove stock IDs but keep a translated title.
+  const semanticCandidate = holder.children().filter((_, element) => {
+    if (element.id === 'anchor_memory_nav_button') return false;
+    const label = [element.getAttribute('title'), element.getAttribute('aria-label'), element.textContent]
+      .filter(Boolean)
+      .join(' ');
+    return /(用户信息|用户设置|个人信息|人格管理|user settings|persona management|account)/i.test(label);
+  }).filter(':visible').first();
+  if (semanticCandidate.length) return semanticCandidate;
+
+  // Last-resort placement still stays inside the native sequence: insert before the final visible
+  // native launcher rather than pinning Anchor Memory to the far edge with a custom flex order.
+  const lastNative = holder.children('.drawer-icon, .menu_button, .interactable')
+    .not('#anchor_memory_nav_button')
+    .filter(':visible')
+    .last();
+  return lastNative.length ? lastNative : null;
+}
+
 function navInsertionTarget() {
-  // Anchor Memory is a top-level launcher, so it belongs to the top settings holder itself.
-  // Inserting it after the Extensions button placed it in the middle of SillyTavern's native
-  // drawer sequence and also bypassed the holder's normal flex alignment.
   const visibleHolder = $('#top-settings-holder').filter(':visible').first();
-  if (visibleHolder.length) return visibleHolder;
+  const holder = visibleHolder.length ? visibleHolder : $('#top-settings-holder').first();
+  if (holder.length) return { holder, before: navbarUserReference(holder) };
 
-  const holder = $('#top-settings-holder').first();
-  if (holder.length) return holder;
+  // Compatibility fallback for themes that replace the stock holder but retain a known user icon.
+  for (const selector of NAVBAR_USER_TARGET_SELECTORS) {
+    const reference = $(selector).filter(':visible').first().length
+      ? $(selector).filter(':visible').first()
+      : $(selector).first();
+    if (reference.length && reference.parent().length) {
+      return { holder: reference.parent(), before: reference };
+    }
+  }
 
-  // Compatibility fallback for themes that replace the holder but retain a native drawer icon.
   const nativeButton = $('#extensionsMenuButton, #extensions-settings-button').first();
-  if (nativeButton.length && nativeButton.parent().length) return nativeButton.parent();
-
+  if (nativeButton.length && nativeButton.parent().length) {
+    return { holder: nativeButton.parent(), before: nativeButton };
+  }
   return null;
+}
+
+function navbarStructuralClasses(reference) {
+  const fallback = ['drawer-icon', 'menu_button', 'interactable'];
+  if (!reference?.length) return fallback;
+  const excludedState = /^(?:active|selected|disabled|hidden|open|closed|drawer-open|drawer-closed|pressed)$/i;
+  const iconClass = /^(?:fa|fas|far|fal|fat|fad|fab|fa-[a-z0-9-]+)$/i;
+  const classes = String(reference.attr('class') || '')
+    .split(/\s+/)
+    .map(value => value.trim())
+    .filter(Boolean)
+    .filter(value => !iconClass.test(value) && !excludedState.test(value) && value !== 'am-navbar-button');
+  return classes.length ? classes : fallback;
+}
+
+function syncNavbarButton(button, reference) {
+  const pluginDisabled = !settings().enabled;
+  const classes = [...new Set(['am-navbar-button', ...navbarStructuralClasses(reference)])].join(' ');
+  if (button.attr('class') !== classes) button.attr('class', classes);
+  button.toggleClass('am-disabled', pluginDisabled);
+  if (!button.children('.am-navbar-letter').length || button.children().length !== 1) {
+    button.empty().append('<span class="am-navbar-letter" aria-hidden="true">A</span>');
+  }
+}
+
+function scheduleNavbarReconcile() {
+  clearTimeout(state.navbarRepairTimer);
+  state.navbarRepairTimer = setTimeout(() => installNavbarEntry(), 40);
+}
+
+function observeNavbar(holder) {
+  const host = holder?.[0];
+  if (!host || state.navbarObservedHost === host) return;
+  state.navbarObserver?.disconnect?.();
+  state.navbarObservedHost = host;
+  state.navbarObserver = new MutationObserver(mutations => {
+    const externalMutation = mutations.some(mutation => {
+      const target = mutation.target instanceof Element ? mutation.target : mutation.target?.parentElement;
+      return !target?.closest?.('#anchor_memory_nav_button');
+    });
+    if (externalMutation) scheduleNavbarReconcile();
+  });
+  state.navbarObserver.observe(host, {
+    childList: true,
+    subtree: true,
+    attributes: true,
+    attributeFilter: ['class', 'style', 'title', 'aria-label'],
+  });
 }
 
 function installNavbarEntry(attempt = 0) {
   const target = navInsertionTarget();
-  if (!target) {
+  if (!target?.holder?.length) {
     if (attempt < 30) setTimeout(() => installNavbarEntry(attempt + 1), 500);
     else console.warn('[AnchorMemory] navbar container not found; workbench entry was not installed');
     return false;
   }
 
-  let button = $('#anchor_memory_nav_button').first();
-  if (!button.length) {
-    button = $('<div id="anchor_memory_nav_button"></div>');
-  }
+  const duplicates = $('#anchor_memory_nav_button');
+  let button = duplicates.first();
+  duplicates.slice(1).remove();
+  if (!button.length) button = $('<div id="anchor_memory_nav_button"></div>');
 
-  // Use SillyTavern's native drawer-icon shell and Font Awesome glyph. Do not draw a custom
-  // letter with independent dimensions: that is what caused the visible baseline mismatch.
+  syncNavbarButton(button, target.before);
   button
-    .attr('class', 'am-navbar-button drawer-icon menu_button interactable fa-solid fa-anchor')
     .attr('title', '锚点书')
     .attr('tabindex', '0')
     .attr('role', 'button')
     .attr('aria-label', '打开锚点书')
-    .empty()
     .off('.anchorMemoryNav')
     .on('click.anchorMemoryNav', openWorkbench)
     .on('keydown.anchorMemoryNav', event => {
@@ -11277,9 +11385,17 @@ function installNavbarEntry(attempt = 0) {
       }
     });
 
-  // Append to the holder itself and keep a high flex order. This remains at the end even when
-  // a theme reorders native drawer buttons, instead of being injected between two stock icons.
-  target.append(button);
+  const beforeNode = target.before?.[0];
+  const hostNode = target.holder[0];
+  if (beforeNode && beforeNode.parentElement === hostNode) {
+    if (button[0].nextElementSibling !== beforeNode || button[0].parentElement !== hostNode) {
+      target.before.before(button);
+    }
+  } else if (button[0].parentElement !== hostNode) {
+    target.holder.append(button);
+  }
+
+  observeNavbar(target.holder);
   return true;
 }
 

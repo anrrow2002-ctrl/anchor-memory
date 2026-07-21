@@ -7,11 +7,30 @@
 
 .am-navbar-button {
   position: relative;
-  order: 999;
-  flex: 0 0 auto;
-  align-self: center;
   box-sizing: border-box;
   cursor: pointer;
+}
+
+/* The launcher deliberately owns no pixel width, height, padding, margin or flex order. Its native
+   neighbour's structural classes control all geometry, so MovingUI and beautification themes can
+   resize/reposition it exactly like the surrounding SillyTavern buttons. */
+.am-navbar-letter {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 1em;
+  height: 1em;
+  margin: auto;
+  color: currentColor;
+  font-family: var(--mainFontFamily, inherit);
+  font-size: 0.78em;
+  font-style: normal;
+  font-weight: 800;
+  line-height: 1;
+  letter-spacing: -0.04em;
+  text-transform: uppercase;
+  user-select: none;
+  pointer-events: none;
 }
 
 .am-navbar-button.am-disabled {
@@ -24,8 +43,8 @@
   position: absolute;
   left: 50%;
   top: 50%;
-  width: 18px;
-  height: 2px;
+  width: 0.9em;
+  height: max(1px, 0.08em);
   border-radius: 999px;
   background: currentColor;
   transform: translate(-50%, -50%) rotate(-45deg);
