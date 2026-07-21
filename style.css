@@ -7,11 +7,10 @@
 
 .am-navbar-button {
   position: relative;
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
-  min-width: 32px;
-  min-height: 32px;
+  order: 999;
+  flex: 0 0 auto;
+  align-self: center;
+  box-sizing: border-box;
   cursor: pointer;
 }
 
@@ -23,24 +22,13 @@
 .am-navbar-button.am-disabled::after {
   content: '';
   position: absolute;
+  left: 50%;
+  top: 50%;
   width: 18px;
   height: 2px;
   border-radius: 999px;
   background: currentColor;
-  transform: rotate(-45deg);
-  pointer-events: none;
-}
-
-.am-navbar-letter {
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
-  width: 1.2em;
-  height: 1.2em;
-  font-weight: 800;
-  font-size: 18px;
-  line-height: 1;
-  text-transform: lowercase;
+  transform: translate(-50%, -50%) rotate(-45deg);
   pointer-events: none;
 }
 

@@ -143,7 +143,7 @@ function isGenerationActive() {
 
 
 const MODULE = 'anchor_memory';
-const EXTENSION_VERSION = '0.9.17';
+const EXTENSION_VERSION = '0.9.18';
 const DATA_KEY = 'anchorMemory';
 const CORE_PROMPT_KEY = 'anchor_memory_core';
 const RECALL_PROMPT_KEY = 'anchor_memory_recall';
@@ -11230,23 +11230,23 @@ function installPublicApi() {
 }
 
 function navInsertionTarget() {
-  const extensionDrawer = $('#extensions-settings-button').first();
-  if (extensionDrawer.length) return { mode: 'after', element: extensionDrawer };
+  // Anchor Memory is a top-level launcher, so it belongs to the top settings holder itself.
+  // Inserting it after the Extensions button placed it in the middle of SillyTavern's native
+  // drawer sequence and also bypassed the holder's normal flex alignment.
+  const visibleHolder = $('#top-settings-holder').filter(':visible').first();
+  if (visibleHolder.length) return visibleHolder;
 
-  const extensionAnchor = $('#extensionsMenu, #extensionsMenuButton').filter(':visible').first();
-  if (extensionAnchor.length) return { mode: 'after', element: extensionAnchor };
+  const holder = $('#top-settings-holder').first();
+  if (holder.length) return holder;
 
-  const container = $('#top-settings-holder').filter(':visible').first();
-  if (container.length) return { mode: 'append', element: container };
-
-  const hiddenExtensionAnchor = $('#extensionsMenu, #extensionsMenuButton').first();
-  if (hiddenExtensionAnchor.length) return { mode: 'after', element: hiddenExtensionAnchor };
+  // Compatibility fallback for themes that replace the holder but retain a native drawer icon.
+  const nativeButton = $('#extensionsMenuButton, #extensions-settings-button').first();
+  if (nativeButton.length && nativeButton.parent().length) return nativeButton.parent();
 
   return null;
 }
 
 function installNavbarEntry(attempt = 0) {
-  if ($('#anchor_memory_nav_button').length) return true;
   const target = navInsertionTarget();
   if (!target) {
     if (attempt < 30) setTimeout(() => installNavbarEntry(attempt + 1), 500);
@@ -11254,21 +11254,32 @@ function installNavbarEntry(attempt = 0) {
     return false;
   }
 
-  const button = $(`
-    <div id="anchor_memory_nav_button" class="am-navbar-button menu_button interactable" title="锚点书" tabindex="0" role="button" aria-label="打开锚点书">
-      <span class="am-navbar-letter" aria-hidden="true">a</span>
-    </div>
-  `);
-  button.on('click', openWorkbench);
-  button.on('keydown', event => {
-    if (event.key === 'Enter' || event.key === ' ') {
-      event.preventDefault();
-      openWorkbench();
-    }
-  });
+  let button = $('#anchor_memory_nav_button').first();
+  if (!button.length) {
+    button = $('<div id="anchor_memory_nav_button"></div>');
+  }
 
-  if (target.mode === 'after') target.element.after(button);
-  else target.element.append(button);
+  // Use SillyTavern's native drawer-icon shell and Font Awesome glyph. Do not draw a custom
+  // letter with independent dimensions: that is what caused the visible baseline mismatch.
+  button
+    .attr('class', 'am-navbar-button drawer-icon menu_button interactable fa-solid fa-anchor')
+    .attr('title', '锚点书')
+    .attr('tabindex', '0')
+    .attr('role', 'button')
+    .attr('aria-label', '打开锚点书')
+    .empty()
+    .off('.anchorMemoryNav')
+    .on('click.anchorMemoryNav', openWorkbench)
+    .on('keydown.anchorMemoryNav', event => {
+      if (event.key === 'Enter' || event.key === ' ') {
+        event.preventDefault();
+        openWorkbench();
+      }
+    });
+
+  // Append to the holder itself and keep a high flex order. This remains at the end even when
+  // a theme reorders native drawer buttons, instead of being injected between two stock icons.
+  target.append(button);
   return true;
 }
 
